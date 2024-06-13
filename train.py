@@ -1,3 +1,7 @@
+# ---------------------------------------------------------------------------------------
+# Train Cifar-10 Model from scratch
+# TODO: current highest test accuracy is 81.06. Can go up to 92.95. Explore Improvements
+# ---------------------------------------------------------------------------------------
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
