@@ -8,6 +8,11 @@ import torchvision
 import train
 from vgg import VGG
 
+Byte = 8
+KB = Byte * 1024
+MB = KB * 1024
+GB = MB * 1024
+
 
 def evaluate_cifar_10(model, device, b_size=128, num_workers=12):
     data_dir = './data/cifar10'
@@ -32,7 +37,9 @@ def evaluate_cifar_10(model, device, b_size=128, num_workers=12):
 
     model = model.to(device)
     acc = train.evaluate(model, test_loader, device)
-    print(f"Cifar-10 test accuracy {acc:0.2f}")
+    # print(f"Cifar-10 test accuracy {acc:0.2f}")
+
+    return acc
 
 
 def get_model_num_parameters(model):
@@ -53,18 +60,51 @@ def get_model_num_parameters(model):
     return n_params
 
 
+def get_model_size(model, data_width=32):
+    n_params = get_model_num_parameters(model) * data_width
+    return n_params
+
+
+def plot_model_weight_distribution(model, bins=256):
+    fig, axes = plt.subplots(3, 3, figsize=(10, 6))
+    axes = axes.ravel()
+
+    plot_index = 0
+    for name, param in model.named_parameters():
+        if param.dim() > 1:
+            ax = axes[plot_index]
+            ax.hist(param.detach().view(-1).cpu(), bins=bins, density=True, color='blue', alpha=0.5)
+            ax.set_xlabel(name)
+            ax.set_ylabel('density')
+            plot_index += 1
+
+    fig.suptitle('Histogram of Weights')
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.925)
+    plt.show()
+
+
 def main(model):
     """
 
     :param model: Trained model
     :return:
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    acc = 81.06
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # acc = evaluate_cifar_10(model, device)
 
-    # evaluate_cifar_10(model, device)
+    # Dense Model Details
+    print(f"Model: {model.__class__.__name__}")
 
     n_params = get_model_num_parameters(model)
-    print(f" Model {model.__class__.__name__} has {n_params} parameters")
+    model_size = get_model_size(model)
+    print(
+        f"Dense Model Acc {acc:0.2f}, Model Size {model_size/MB:0.2f}MB. "
+        f"Number of parameters {n_params} ")
+    plot_model_weight_distribution(model)
+    gcf = plt.gcf()
+    gcf.suptitle("Dense Model Weight Distribution")
 
     import pdb
     pdb.set_trace()
