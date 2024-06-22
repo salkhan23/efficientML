@@ -65,6 +65,15 @@ def get_model_size(model, data_width=32):
     return n_params
 
 
+def get_tensor_sparsity(tensor):
+    """
+    Sparisity defined as n_zeros/n_elements
+    :param tensor:
+    :return:
+    """
+    return 1 - (tensor.count_nonzero() / tensor.numel())
+
+
 def plot_model_weight_distribution(model, bins=256):
     fig, axes = plt.subplots(3, 3, figsize=(10, 6))
     axes = axes.ravel()
@@ -103,13 +112,14 @@ def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
 
     n_elements = tensor.numel()  # number of elements
     n_zeros = n_elements - tensor.count_nonzero()
+    print(f"pre-pruning sparsity {get_tensor_sparsity(tensor)}")
 
     # Magnitude based pruning
     importance = torch.abs(tensor)
 
     # Calculate the pruning threshold - all synapses w/ importance < threshold will be removed
-    n_non_zeros_want = round(n_elements * sparsity)  # Number of non-zeros to get the desired sparsity
-    n_zeros_want = n_elements - n_non_zeros_want
+    n_zeros_want = round(n_elements * sparsity)  # Number of non-zeros to get the desired sparsity
+    n_non_zeros_want = n_elements - n_zeros_want
     if n_zeros > n_zeros_want:
         return torch.ones_like(tensor)  # already below target sparsity
 
@@ -121,10 +131,12 @@ def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
     th = min(values)
     mask = torch.gt(abs(tensor), th * torch.ones_like(tensor))
 
-    # inplace multiple with the mask
+    # inplace multiple with the mask . Detach needed for in-place operation.
     with torch.no_grad():
         tensor.detach()
         tensor.mul_(mask)
+
+    print(f" after pruning sparsity {get_tensor_sparsity(tensor)}")
 
     return mask
 
@@ -152,7 +164,7 @@ def main(model):
     gcf.suptitle("Dense Model Weight Distribution")
 
     # Prune a random layer
-    fine_grained_prune(model.backbone.conv1.weight, 0.5)
+    fine_grained_prune(model.backbone.conv1.weight, 0.75)
 
     plot_model_weight_distribution(model)
     gcf = plt.gcf()
