@@ -84,6 +84,51 @@ def plot_model_weight_distribution(model, bins=256):
     plt.show()
 
 
+def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
+    """
+    magnitude-based pruning for single tensor
+    :param tensor: torch.(cuda.)Tensor, weight of conv/fc layer
+    :param sparsity: float, pruning sparsity
+                     = #zeros / #elements = 1 - #nonzeros / #elements
+    :return:
+        torch.(cuda.)Tensor, mask for zeros
+    """
+    sparsity = min(max(0.0, sparsity), 1.0)
+
+    # Extreme Cases
+    if sparsity == 1.0:
+        return torch.zeros_like(tensor)
+    elif sparsity == 0.0:
+        return torch.ones_like(tensor)
+
+    n_elements = tensor.numel()  # number of elements
+    n_zeros = n_elements - tensor.count_nonzero()
+
+    # Magnitude based pruning
+    importance = torch.abs(tensor)
+
+    # Calculate the pruning threshold - all synapses w/ importance < threshold will be removed
+    n_non_zeros_want = round(n_elements * sparsity)  # Number of non-zeros to get the desired sparsity
+    n_zeros_want = n_elements - n_non_zeros_want
+    if n_zeros > n_zeros_want:
+        return torch.ones_like(tensor)  # already below target sparsity
+
+    # Get the indices of weights to keep
+    imp_flattened = importance.flatten()
+    values, indexes = torch.topk(imp_flattened, n_non_zeros_want)
+
+    # Create a mask
+    th = min(values)
+    mask = torch.gt(abs(tensor), th * torch.ones_like(tensor))
+
+    # inplace multiple with the mask
+    with torch.no_grad():
+        tensor.detach()
+        tensor.mul_(mask)
+
+    return mask
+
+
 def main(model):
     """
 
@@ -105,6 +150,13 @@ def main(model):
     plot_model_weight_distribution(model)
     gcf = plt.gcf()
     gcf.suptitle("Dense Model Weight Distribution")
+
+    # Prune a random layer
+    fine_grained_prune(model.backbone.conv1.weight, 0.5)
+
+    plot_model_weight_distribution(model)
+    gcf = plt.gcf()
+    gcf.suptitle("After pruning")
 
     import pdb
     pdb.set_trace()
