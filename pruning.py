@@ -135,10 +135,6 @@ def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
     mask = torch.gt(th * torch.ones_like(tensor), abs(tensor))
     mask = ~mask
 
-    th_idx = indexes[-1]
-    th = tensor.flatten()[th_idx]
-    mask = torch.gt(abs(tensor), th * torch.ones_like(tensor))
-
     # inplace multiple with the mask . Detach needed for in-place operation.
     with torch.no_grad():
         tensor.detach()
