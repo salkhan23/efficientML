@@ -145,6 +145,44 @@ def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
     return mask
 
 
+class FineGrainPruner:
+    def __init__(self, model, sparsity_dict):
+        """
+        Apply fine grain (element-wise pruning) on each named model parameter in the sparsity dictionary
+
+        :param model:
+        :param sparsity_dict: a dictionary with keys model names and value equal to the pruning ratio
+        """
+        self.masks = self.prune(model, sparsity_dict)
+
+    @staticmethod
+    @torch.no_grad()
+    def prune(model, sparsity_dict):
+        """
+        Prune the Model
+
+        :param model:
+        :param sparsity_dict:
+        :return:
+        """
+        masks = {}
+
+        for name, param in model.named_parameters():
+            print(name)
+            sparsity_ratio = sparsity_dict.get(name, None)
+            if sparsity_ratio is not None:
+                masks[name] = fine_grained_prune(param, sparsity_ratio)
+
+        return masks
+
+    @torch.no_grad()
+    def apply_masks(self, model):
+        """ Apply pruning masks to model """
+        for name, param in model.named_parameters():
+            if name in self.masks:
+                param *= self.masks[name]
+
+
 def main(model):
     """
 
@@ -167,8 +205,16 @@ def main(model):
     gcf = plt.gcf()
     gcf.suptitle("Dense Model Weight Distribution")
 
-    # Prune a random layer
-    fine_grained_prune(model.backbone.conv1.weight, 0.75)
+    # # Prune a random layer
+    # fine_grained_prune(model.backbone.conv1.weight, 0.75)
+
+    # Prune the whole model with a single sparsity ratio
+    sparse_dict = {}
+    for name, param in model.named_parameters():
+        if param.ndim > 1:
+            sparse_dict[name] = 0.5
+
+    pruner = FineGrainPruner(model, sparse_dict)
 
     plot_model_weight_distribution(model)
     gcf = plt.gcf()
