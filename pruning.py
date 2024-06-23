@@ -96,6 +96,7 @@ def plot_model_weight_distribution(model, bins=256):
 def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
     """
     magnitude-based pruning for single tensor
+
     :param tensor: torch.(cuda.)Tensor, weight of conv/fc layer
     :param sparsity: float, pruning sparsity
                      = #zeros / #elements = 1 - #nonzeros / #elements
@@ -129,6 +130,13 @@ def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
 
     # Create a mask
     th = min(values)
+    # mask = torch.gt(abs(tensor), th * torch.ones_like(tensor))
+    # torch.gt only does >. Find all places th > abs(tensor), then reverse it
+    mask = torch.gt(th * torch.ones_like(tensor), abs(tensor))
+    mask = ~mask
+
+    th_idx = indexes[-1]
+    th = tensor.flatten()[th_idx]
     mask = torch.gt(abs(tensor), th * torch.ones_like(tensor))
 
     # inplace multiple with the mask . Detach needed for in-place operation.
