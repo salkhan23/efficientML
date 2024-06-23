@@ -113,7 +113,7 @@ def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
 
     n_elements = tensor.numel()  # number of elements
     n_zeros = n_elements - tensor.count_nonzero()
-    print(f"pre-pruning sparsity {get_tensor_sparsity(tensor)}")
+    # print(f"pre-pruning sparsity {get_tensor_sparsity(tensor)}")
 
     # Magnitude based pruning
     importance = torch.abs(tensor)
@@ -140,7 +140,7 @@ def fine_grained_prune(tensor: torch.Tensor, sparsity: float) -> torch.Tensor:
         tensor.detach()
         tensor.mul_(mask)
 
-    print(f" after pruning sparsity {get_tensor_sparsity(tensor)}")
+    # print(f" after pruning sparsity {get_tensor_sparsity(tensor)}")
 
     return mask
 
@@ -183,6 +183,59 @@ class FineGrainPruner:
                 param *= self.masks[name]
 
 
+torch.no_grad()
+def sensitivity_scan(model, device, scan_step=0.1, scan_start=0.4, scan_end=1.0, verbose=True):
+    """
+
+    :param model:
+    :param device:
+    :param scan_step:
+    :param scan_start:
+    :param scan_end:
+    :param verbose:
+    :return:
+    """
+    sparsity_range = np.arange(scan_start, scan_end, scan_step)
+
+    accuracies = []  # per layer, each column is different sparsity ratio
+    scanned_layer_names = []
+
+    for name, param in model.named_parameters():
+
+        if param.ndim > 1:
+            print(f"Starting sparsity {get_tensor_sparsity(param)}")
+            org_param = param.detach().clone()
+
+            layer_accuracies = []
+            for sparsity in sparsity_range:
+                fine_grained_prune(param, sparsity)
+                acc = evaluate_cifar_10(model, device)
+                layer_accuracies.append(acc)
+
+                param.data.copy_(org_param.data)   # restore the original weights
+                print(f"Layer {name}. Sparsity {sparsity:.2f}. Accuracy {acc:.2f}")
+
+            accuracies.append(layer_accuracies)
+
+            formatted_layer_acc = ", ".join([f"{item:.2f}" for item in layer_accuracies])
+            print(f"Layer {name}. Accuracies {formatted_layer_acc}")
+            scanned_layer_names.append(name)
+
+            print(f"End sparsity {get_tensor_sparsity(param)}")
+
+            import pdb
+            pdb.set_trace()
+
+    plt.figure(size=(9, 9))
+    for idx, acc_profile in enumerate(accuracies):
+        plt.plot(sparsity_range, acc_profile, label=scanned_layer_names[idx])
+    plt.legend()
+
+
+
+    return accuracies, sparsity_range
+
+
 def main(model):
     """
 
@@ -190,7 +243,7 @@ def main(model):
     :return:
     """
     acc = 81.06
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # acc = evaluate_cifar_10(model, device)
 
     # Dense Model Details
@@ -205,20 +258,23 @@ def main(model):
     gcf = plt.gcf()
     gcf.suptitle("Dense Model Weight Distribution")
 
-    # # Prune a random layer
-    # fine_grained_prune(model.backbone.conv1.weight, 0.75)
+    # # # Prune a random layer # --------------------------------------------------------------------
+    # # fine_grained_prune(model.backbone.conv1.weight, 0.75)
 
-    # Prune the whole model with a single sparsity ratio
-    sparse_dict = {}
-    for name, param in model.named_parameters():
-        if param.ndim > 1:
-            sparse_dict[name] = 0.5
+    # # Prune the whole model with a single sparsity ratio ------------------------------------------
+    # sparse_dict = {}
+    # for name, param in model.named_parameters():
+    #     if param.ndim > 1:
+    #         sparse_dict[name] = 0.5
+    #
+    # FineGrainPruner(model, sparse_dict)
+    #
+    # plot_model_weight_distribution(model)
+    # gcf = plt.gcf()
+    # gcf.suptitle("After pruning ")
 
-    pruner = FineGrainPruner(model, sparse_dict)
-
-    plot_model_weight_distribution(model)
-    gcf = plt.gcf()
-    gcf.suptitle("After pruning")
+    # Different running ratio for each layer  -----------------------------------------------------
+    sensitivity_scan(model, device)
 
     import pdb
     pdb.set_trace()
