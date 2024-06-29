@@ -24,6 +24,64 @@ def show_image(img, title=None):
     plt.title(title)
 
 
+def get_cifar10_datasets_and_data_loaders(data_dir, b_size):
+    """
+    Loads the CIFAR-10 dataset and creates data loaders for training and testing.
+
+    :param data_dir: dir where the CIFAR-10 dataset is/will be stored.
+    :param b_size: Batch Size
+
+    :return: tuple containing
+        training dataset,
+        training data loader,
+        testing dataset,
+        testing data loader,
+        and class names.
+    """
+    transforms_train = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, 4),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+    ])
+
+    transforms_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+    ])
+
+    train_set = torchvision.datasets.CIFAR10(
+        root=data_dir,
+        train=True,
+        download=True,
+        transform=transforms_train
+    )
+
+    train_loader = torch.utils.data.DataLoader(
+        train_set,
+        batch_size=b_size,
+        shuffle=True,
+        num_workers=12
+    )
+
+    test_set = torchvision.datasets.CIFAR10(
+        root=data_dir,
+        train=False,
+        download=True,
+        transform=transforms_test
+    )
+
+    test_loader = torch.utils.data.DataLoader(
+        test_set,
+        batch_size=b_size,
+        shuffle=False,
+        num_workers=12)
+
+    classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+
+    return train_set, train_loader, test_set, test_loader, classes
+
+
 def evaluate(model, data_loader, device):
     model.eval()
 
@@ -68,46 +126,8 @@ def main(b_size, random_seed=10, data_dir='./data', save_dir='./results_trained_
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    transforms_train = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomCrop(32, 4),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
-    ])
-
-    transforms_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
-    ])
-
-    train_set = torchvision.datasets.CIFAR10(
-        root=data_dir,
-        train=True,
-        download=True,
-        transform=transforms_train
-    )
-
-    train_loader = torch.utils.data.DataLoader(
-        train_set,
-        batch_size=b_size,
-        shuffle=True,
-        num_workers=12
-    )
-
-    test_set = torchvision.datasets.CIFAR10(
-        root=data_dir,
-        train=False,
-        download=True,
-        transform=transforms_test
-    )
-
-    test_loader = torch.utils.data.DataLoader(
-        test_set,
-        batch_size=b_size,
-        shuffle=False,
-        num_workers=12)
-
-    classes = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+    train_data_set, train_loader, test_data_set, test_loader, _ = (
+        get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
 
     # Debug ---------------------------------------------------------------------------------------
     # # Display a single Image
