@@ -1,3 +1,7 @@
+# -------------------------------------------------------------------------------------------------
+# Pruning Techniques and methods to find the best pruning ratio for individual layers of a model
+#
+# -------------------------------------------------------------------------------------------------
 import numpy as np
 import os
 import matplotlib.pyplot as plt
@@ -5,41 +9,13 @@ import matplotlib.pyplot as plt
 import torch
 import torchvision
 
-import train
+import train_cifar10
 from vgg import VGG
 
 Byte = 8
 KB = Byte * 1024
 MB = KB * 1024
 GB = MB * 1024
-
-
-def evaluate_cifar_10(model, device, b_size=128, num_workers=12):
-    data_dir = './data/cifar10'
-
-    transforms_test = torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor(),
-        torchvision.transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
-    ])
-
-    test_set = torchvision.datasets.CIFAR10(
-        root=data_dir,
-        train=False,
-        download=True,
-        transform=transforms_test
-    )
-
-    test_loader = torch.utils.data.DataLoader(
-        test_set,
-        batch_size=b_size,
-        shuffle=False,
-        num_workers=num_workers)
-
-    model = model.to(device)
-    acc = train.evaluate(model, test_loader, device)
-    # print(f"Cifar-10 test accuracy {acc:0.2f}")
-
-    return acc
 
 
 def get_model_num_parameters(model):
@@ -67,7 +43,7 @@ def get_model_size(model, data_width=32):
 
 def get_tensor_sparsity(tensor):
     """
-    Sparisity defined as n_zeros/n_elements
+    Sparsity defined as n_zeros/n_elements
     :param tensor:
     :return:
     """
@@ -183,17 +159,17 @@ class FineGrainPruner:
                 param *= self.masks[name]
 
 
-torch.no_grad()
-def sensitivity_scan(model, device, scan_step=0.1, scan_start=0.4, scan_end=1.0, verbose=True):
+def sensitivity_scan(model, device, test_loader, scan_step=0.1, scan_start=0.4, scan_end=1.0):
     """
+    Perform sensitivity analysis by scanning through different sparsity levels for each layer's weights.
 
-    :param model:
-    :param device:
-    :param scan_step:
-    :param scan_start:
-    :param scan_end:
-    :param verbose:
-    :return:
+    :param model: The neural network model.
+    :param device: The device to run the model on (e.g., 'cpu', 'cuda').
+    :param test_loader: The data loader for the test dataset.
+    :param scan_step: The step size for scanning sparsity levels, defaults to 0.1.
+    :param scan_start: The starting sparsity level, defaults to 0.4.
+    :param scan_end: The ending sparsity level (exclusive), defaults to 1.0.
+    :return: Tuple containing accuracies per layer, sparsity range, and names
     """
     sparsity_range = np.arange(scan_start, scan_end, scan_step)
 
@@ -203,37 +179,31 @@ def sensitivity_scan(model, device, scan_step=0.1, scan_start=0.4, scan_end=1.0,
     for name, param in model.named_parameters():
 
         if param.ndim > 1:
-            print(f"Starting sparsity {get_tensor_sparsity(param)}")
-            org_param = param.detach().clone()
+            print(f"Analyzing Layer {name}.")
+            print(f"\tstart sparsity {get_tensor_sparsity(param)}. ")
 
+            org_param = param.detach().clone()
             layer_accuracies = []
+
             for sparsity in sparsity_range:
                 fine_grained_prune(param, sparsity)
-                acc = evaluate_cifar_10(model, device)
-                layer_accuracies.append(acc)
 
-                param.data.copy_(org_param.data)   # restore the original weights
-                print(f"Layer {name}. Sparsity {sparsity:.2f}. Accuracy {acc:.2f}")
+                with torch.no_grad():
+                    acc = train_cifar10.evaluate(model, test_loader, device)
+
+                layer_accuracies.append(acc)
+                param.data.copy_(org_param.data)  # restore the original weights
+
+                # print(f"\tstart sparsity {get_tensor_sparsity(param)}. ")
+                # print(f"\t    @ sparsity {get_tensor_sparsity(param)}. Accuracy {acc:.2f}")
 
             accuracies.append(layer_accuracies)
-
-            formatted_layer_acc = ", ".join([f"{item:.2f}" for item in layer_accuracies])
-            print(f"Layer {name}. Accuracies {formatted_layer_acc}")
             scanned_layer_names.append(name)
 
-            print(f"End sparsity {get_tensor_sparsity(param)}")
+            print(f"\tLayer '{name}' accuracies: {', '.join([f'{acc:.2f}' for acc in layer_accuracies])}")
+            print(f"\tFinal sparsity: {get_tensor_sparsity(param):.2f}")
 
-            import pdb
-            pdb.set_trace()
-
-    plt.figure(size=(9, 9))
-    for idx, acc_profile in enumerate(accuracies):
-        plt.plot(sparsity_range, acc_profile, label=scanned_layer_names[idx])
-    plt.legend()
-
-
-
-    return accuracies, sparsity_range
+    return accuracies, sparsity_range, scanned_layer_names
 
 
 def main(model):
@@ -242,9 +212,19 @@ def main(model):
     :param model: Trained model
     :return:
     """
-    acc = 81.06
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # acc = evaluate_cifar_10(model, device)
+    model.to(device)
+
+    b_size = 128
+    data_dir = './data'
+
+    # Data
+    train_data_set, train_loader, test_data_set, test_loader, _ = (
+        train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
+
+    acc = 81.06
+    # acc = train_cifar10.evaluate(model, test_loader, device)
 
     # Dense Model Details
     print(f"Model: {model.__class__.__name__}")
@@ -252,29 +232,48 @@ def main(model):
     n_params = get_model_num_parameters(model)
     model_size = get_model_size(model)
     print(
-        f"Dense Model Acc {acc:0.2f}, Model Size {model_size/MB:0.2f}MB. "
+        f"Dense Model Acc {acc:0.2f}, Model Size {model_size / MB:0.2f}MB. "
         f"Number of parameters {n_params} ")
     plot_model_weight_distribution(model)
     gcf = plt.gcf()
     gcf.suptitle("Dense Model Weight Distribution")
 
-    # # # Prune a random layer # --------------------------------------------------------------------
-    # # fine_grained_prune(model.backbone.conv1.weight, 0.75)
+    # # Prune a random layer # ------------------------------------------------------------------------
+    # layer_to_prune = "backbone.conv1"
+    # sparsity = 0.75
+    #
+    # model_layers = dict(model.named_modules())  # creates a dictionary of model layers
+    #
+    # if layer_to_prune in model_layers:
+    #     layer = model_layers[layer_to_prune]
+    #     layer_w = layer.weight
+    #
+    #     print(f"Prune Layer '{layer_to_prune}'. Target Sparsity: {sparsity}.")
+    #
+    #     start_sparsity = get_tensor_sparsity(layer_w)
+    #     fine_grained_prune(layer_w, sparsity)
+    #     end_sparsity = get_tensor_sparsity(layer_w)
+    #     print(f"Done. Start Sparsity {start_sparsity}. Final Sparsity {end_sparsity}")
+    # else:
+    #     raise ValueError(f"Layer {layer_to_prune} not in model")
 
     # # Prune the whole model with a single sparsity ratio ------------------------------------------
-    # sparse_dict = {}
-    # for name, param in model.named_parameters():
-    #     if param.ndim > 1:
-    #         sparse_dict[name] = 0.5
+    # sparsity = 0.75
     #
+    # sparse_dict = {name: sparsity for name, param in model.named_parameters()}
     # FineGrainPruner(model, sparse_dict)
     #
     # plot_model_weight_distribution(model)
     # gcf = plt.gcf()
-    # gcf.suptitle("After pruning ")
+    # gcf.suptitle(f"Weight distribution After pruning with fix sparsity {sparsity}")
 
     # Different running ratio for each layer  -----------------------------------------------------
-    sensitivity_scan(model, device)
+    acc_per_layer, sparsity_range, layer_name_list = sensitivity_scan(model, device, test_loader)
+
+    plt.figure(figsize=(9, 9))
+    for idx, acc_profile in enumerate(acc_per_layer):
+        plt.plot(sparsity_range, acc_profile, label=layer_name_list[idx])
+    plt.legend()
 
     import pdb
     pdb.set_trace()
@@ -288,12 +287,8 @@ if __name__ == "__main__":
     np.random.seed(random_seed)
     torch.random.manual_seed(random_seed)
 
-    if torch.cuda.is_available():
-        print("CUDA is available. Moving model to GPU...")
-    else:
-        print("CUDA is not available. Moving model to CPU...")
+    print(f"GPU is available? {torch.cuda.is_available()}")
 
-    # ---------------------------------------------------------------
     # load the model
     if not os.path.exists(saved_model_file):
         raise FileNotFoundError(f"Cannot find stored model file {saved_model_file}")
