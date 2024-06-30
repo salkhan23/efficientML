@@ -5,6 +5,7 @@
 import numpy as np
 import os
 import matplotlib.pyplot as plt
+from datetime import datetime
 
 import torch
 import torchvision
@@ -206,6 +207,89 @@ def sensitivity_scan(model, device, test_loader, scan_step=0.1, scan_start=0.4, 
     return accuracies, sparsity_range, scanned_layer_names
 
 
+def plot_sensitivity_scan_results_single_plot(sparsity_range, acc_per_layer, layer_names_list, full_model_acc):
+    """
+
+    :param sparsity_range:
+    :param acc_per_layer:
+    :param layer_names_list:
+    :param full_model_acc:
+    :return:
+    """
+    fig = plt.figure(figsize=(10, 6))
+
+    for idx, acc_profile in enumerate(acc_per_layer):
+        plt.plot(sparsity_range, acc_profile, label=layer_names_list[idx])
+
+    plt.axhline(full_model_acc, label=f'full model acc {full_model_acc:0.2f}')
+
+    plt.legend()
+    plt.grid()
+
+    plt.xlabel("Sparsity")
+    plt.ylabel("Top 1 Accuracy")
+    fig.suptitle("Sensitive Scan Analysis")
+
+    plt.tight_layout()
+
+
+def plot_sensitivity_scan_results_individual_layers(sparsity_range, acc_per_layer, layer_names_list, full_model_acc):
+    """
+    Plot pruning results for individual layers separately.
+
+    :param sparsity_range: List or array of sparsity ratios
+    :param acc_per_layer: List of lists or 2D array with accuracy values per layer
+    :param layer_names_list: List of layer names
+    :param full_model_acc: Accuracy of the full model
+
+    :return: None
+    """
+    n_layers = len(acc_per_layer)
+    subplot_dim = int(np.ceil(np.sqrt(n_layers)))
+
+    fig, axes = plt.subplots(subplot_dim, subplot_dim, figsize=(15, 8))
+    fig.suptitle("Sensitive Scan Analysis")
+
+    axes = axes.ravel()
+    for l_idx, layer_name in enumerate(layer_names_list):
+        axes[l_idx].plot(sparsity_range, acc_per_layer[l_idx], color='blue')
+        axes[l_idx].axhline(full_model_acc, label=f'full model acc {full_model_acc:0.2f}', color='r')
+        axes[l_idx].set_xlabel("Sparsity ratio")
+        axes[l_idx].set_ylabel("Top 1% accuracy")
+        axes[l_idx].grid()
+        axes[l_idx].set_title(layer_name)
+
+    # Hide any unused subplots
+    for ax in axes[n_layers:]:
+        ax.set_visible(False)
+
+    fig.tight_layout()
+
+
+def plot_num_params_distribution(model):
+    """
+    Plot the distribution of the number of parameters in each layer of the model.
+
+    :param model: The model whose parameters are to be plotted.
+
+    :return: None
+    """
+    layer_names = []
+    layer_num_params = []
+
+    for name, param in model.named_parameters():
+        if param.ndim > 1:
+            layer_names.append(name)
+            layer_num_params.append(param.numel())
+
+    plt.figure(plt.figure(figsize=(10, 6)))
+    plt.bar(np.arange(len(layer_names)), layer_num_params)
+    plt.xlabel("Layer")
+    plt.xticks(np.arange(len(layer_names)), layer_names, rotation=90)
+    plt.ylabel("Number of parameters")
+    plt.title("Number of parameters per layer")
+
+
 def main(model):
     """
 
@@ -223,8 +307,8 @@ def main(model):
     train_data_set, train_loader, test_data_set, test_loader, _ = (
         train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
 
-    acc = 81.06
-    # acc = train_cifar10.evaluate(model, test_loader, device)
+    full_model_acc = 81.06
+    # full_model_acc = train_cifar10.evaluate(model, test_loader, device)
 
     # Dense Model Details
     print(f"Model: {model.__class__.__name__}")
@@ -232,7 +316,7 @@ def main(model):
     n_params = get_model_num_parameters(model)
     model_size = get_model_size(model)
     print(
-        f"Dense Model Acc {acc:0.2f}, Model Size {model_size / MB:0.2f}MB. "
+        f"Dense Model Acc {full_model_acc:0.2f}, Model Size {model_size / MB:0.2f}MB. "
         f"Number of parameters {n_params} ")
     plot_model_weight_distribution(model)
     gcf = plt.gcf()
@@ -267,13 +351,22 @@ def main(model):
     # gcf = plt.gcf()
     # gcf.suptitle(f"Weight distribution After pruning with fix sparsity {sparsity}")
 
-    # Different running ratio for each layer  -----------------------------------------------------
+    # Different sparsity ratio for each layer  -----------------------------------------------------
+    print("Starting sensitivity scan ...")
+    start_time = datetime.now()
+
     acc_per_layer, sparsity_range, layer_name_list = sensitivity_scan(model, device, test_loader)
 
-    plt.figure(figsize=(9, 9))
-    for idx, acc_profile in enumerate(acc_per_layer):
-        plt.plot(sparsity_range, acc_profile, label=layer_name_list[idx])
-    plt.legend()
+    print(f"Sensitivity scan complete. Took {datetime.now() - start_time}")
+
+    # Plot pruning results - single plot
+    plot_sensitivity_scan_results_single_plot(sparsity_range, acc_per_layer, layer_name_list, full_model_acc)
+    plot_sensitivity_scan_results_individual_layers(sparsity_range, acc_per_layer, layer_name_list, full_model_acc)
+
+    # PLot the number of parameters per layer
+    plot_num_params_distribution(model)
+
+    # Given a minimum performance, and a target sparsity ratio. Find the sparsity ratio of each layer
 
     import pdb
     pdb.set_trace()
