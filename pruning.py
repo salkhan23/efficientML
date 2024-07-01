@@ -6,6 +6,8 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from datetime import datetime
+import copy
+import pickle
 
 import torch
 import torchvision
@@ -204,6 +206,9 @@ def sensitivity_scan(model, device, test_loader, scan_step=0.1, scan_start=0.4, 
             print(f"\tLayer '{name}' accuracies: {', '.join([f'{acc:.2f}' for acc in layer_accuracies])}")
             print(f"\tFinal sparsity: {get_tensor_sparsity(param):.2f}")
 
+        # if name == 'backbone.conv1.weight':
+        #     break
+
     return accuracies, sparsity_range, scanned_layer_names
 
 
@@ -294,30 +299,100 @@ def get_model_sparsity(model):
     """
     Calculate the sparsity of a PyTorch model.
 
-    :param model:
-    :return:
+   - total_sparsity (float): The overall sparsity of the model.
+    - sparsity_dict (dict): A dictionary mapping parameter names to their sparsity ratios.
+    - n_param_dict (dict): A dictionary mapping parameter names to the number of parameters.
     """
     model_sparsity = 0
     total_param = 0
 
+    sparsity_dict = {}
+    n_param_dict = {}
+
     for name, param in model.named_parameters():
         if param.ndim > 1:
             n_param = param.numel()
-            model_sparsity += get_tensor_sparsity(param) * n_param
+            sparsity_param = get_tensor_sparsity(param)
 
-            # print(f"Layer {name}: Sparsity {get_tensor_sparsity(param):0.2f}")
+            model_sparsity += sparsity_param * n_param
             total_param += n_param
+
+            sparsity_dict[name] = sparsity_param
+            n_param_dict[name] = n_param
 
     if total_param > 0:
         model_sparsity = model_sparsity / total_param
 
-    return model_sparsity
+    return model_sparsity, sparsity_dict, n_param_dict
 
 
-def main(model):
+def find_layer_sparsity_ratios(
+        target_model_sparsity, max_performance_drop, model, model_acc, sparsity_range, acc_per_layer,
+        layer_name_list):
     """
 
+    :param target_model_sparsity: n_zeros/ n_weights for all multi-dim model parameters
+    :param max_performance_drop: # Max drop in performance allowed (percentage)
+    :param model:
+    :param model_acc: Total Dense (unpruned model) accuracy.
+    :param sparsity_range: Sparsity Range the sensitivity for which acc_per_layer and layer_name_list is provided
+    :param acc_per_layer:  List of accuracies for each model param in the sensitivity scan. Each
+                           item in the list is another list of accuracies of that param for each
+                           sparsity ratio in the sparsity range
+    :param layer_name_list: List of model params in the  sensitivity scan result.
+    :return:
+    """
+    acc_low_th = model_acc - max_performance_drop
+    acc_per_layer = np.array(acc_per_layer)
+
+    total_sparsity, sparsity_dict, n_params_dict = get_model_sparsity(model)
+
+    def estimate_total_sparsity(sparsity_ratio_dict, num_params_dict):
+        tot_sparsity = 0
+        tot_n_params = 0
+        for p_name, p_num_el in num_params_dict.items():
+            tot_sparsity += p_num_el * sparsity_ratio_dict[p_name]
+            tot_n_params += p_num_el
+
+        if tot_n_params != 0:
+            tot_sparsity = tot_sparsity / tot_n_params
+
+        return tot_sparsity
+
+    target_sparsities = copy.deepcopy(sparsity_dict)
+
+    # Start pruning @ the deep-end, the least sensitive layers are usually there
+    named_parameters = list(model.named_parameters())
+    named_parameters = reversed(named_parameters)
+    for name, param in named_parameters:
+        if param.ndim > 1 and name in layer_name_list:
+
+            results_idx = layer_name_list.index(name)  # index for the sparsity results
+
+            layer_acc_above = np.where(acc_per_layer[results_idx, :] >= acc_low_th)[0]
+
+            # if any sparsity ratio meets the criteria
+            if layer_acc_above.size > 0:
+                max_sparsity_idx = layer_acc_above[-1]  # find the Largest allowed sparsity ratio
+                max_sparsity = sparsity_range[max_sparsity_idx]
+                target_sparsities[name] = max_sparsity
+
+                # check if the target sparsity for the whole model is met, exit if it is
+                new_model_sparsity = estimate_total_sparsity(target_sparsities, n_params_dict)
+                print(f"After pruning layer '{name}' to sparsity {target_sparsities[name]:0.2f}. "
+                      f"Total Model Sparsity {new_model_sparsity:0.2f}")
+
+                if new_model_sparsity >= target_model_sparsity:
+                    print(f"Target Model Sparsity {target_model_sparsity:0.2f} Achieved")
+                    break
+
+    return target_sparsities
+
+
+def main(model, results_store_dir):
+    """
     :param model: Trained model
+    :param results_store_dir:
     :return:
     """
 
@@ -339,7 +414,7 @@ def main(model):
 
     n_params = get_model_num_parameters(model)
     model_size = get_model_size(model)
-    model_sparsity = get_model_sparsity(model)
+    model_sparsity, _, _ = get_model_sparsity(model)
     print(
         f"Dense Model Details :\n"
         f"\tTop-1 Accuracy             : { model_acc :0.2f}\n"
@@ -381,23 +456,73 @@ def main(model):
     # gcf.suptitle(f"Weight distribution After pruning with fix sparsity {sparsity}")
 
     # Different sparsity ratio for each layer  -----------------------------------------------------
-    print("Starting sensitivity scan ...")
-    start_time = datetime.now()
+    sensitivity_scan_results_filename = 'sensitivity_results.pickle'
+    sensitivity_scan_results_file = os.path.join(results_store_dir, sensitivity_scan_results_filename)
 
-    acc_per_layer, sparsity_range, layer_name_list = sensitivity_scan(model, device, test_loader)
+    if not os.path.exists(sensitivity_scan_results_file):
+        print("Starting sensitivity scan ...")
+        start_time = datetime.now()
 
-    print(f"Sensitivity scan complete. Took {datetime.now() - start_time}")
+        acc_per_layer, sparsity_range, layer_name_list = sensitivity_scan(model, device, test_loader)
+
+        print(f"Sensitivity scan complete. Took {datetime.now() - start_time}")
+
+        # Store the results for future results:
+        with open(sensitivity_scan_results_file, 'wb') as f_handle:
+            results_dict = {
+                'acc_per_layer': acc_per_layer,
+                'sparsity_range': sparsity_range,
+                'layer_name_list': layer_name_list
+            }
+            pickle.dump(results_dict, f_handle, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        print(f"Loading sensitivity scan results from {sensitivity_scan_results_file}")
+
+        with open(sensitivity_scan_results_file, 'rb') as f_handle:
+            results_dict = pickle.load(f_handle)
+            acc_per_layer = results_dict['acc_per_layer']
+            sparsity_range = results_dict['sparsity_range']
+            layer_name_list = results_dict['layer_name_list']
 
     # Plot pruning results
     plot_sensitivity_scan_results_single_plot(sparsity_range, acc_per_layer, layer_name_list, model_acc)
     plot_sensitivity_scan_results_individual_layers(sparsity_range, acc_per_layer, layer_name_list, model_acc)
 
-    # PLot the number of parameters per layer
+    # Plot the number of parameters per layer
     plot_num_params_distribution(model)
 
-    # Given a minimum performance, and a target sparsity ratio. Find the sparsity ratio of each layer
+    # Given a min performance and a target sparsity ratio, find sparsity ratios of each layer
+    # ---------------------------------------------------------------------------------------------
     target_model_sparsity = 0.75  # n_zeros/ n_weights
-    min_performance_drop = 0.05  # Max drop in performance allowed
+    max_performance_drop = 5  # Max drop in performance allowed (max accuracy = 100%)
+
+    print(f"Finding model sparsity ratios to get a total sparsity of {target_model_sparsity:0.2f}. "
+          f"Max Allowed performance Drop {max_performance_drop:0.2f}")
+
+    sparse_dict = find_layer_sparsity_ratios(
+        target_model_sparsity,
+        max_performance_drop,
+        model,
+        model_acc,
+        sparsity_range,
+        acc_per_layer,
+        layer_name_list
+    )
+
+    print(f"Pruning Model ...")
+    FineGrainPruner(model, sparse_dict)
+    with torch.no_grad():
+        pruned_model_acc = train_cifar10.evaluate(model, test_loader, device)
+    pruned_model_sparsity, _, _ = get_model_sparsity(model)
+
+    print(
+        f"Pruned Model Details (no fine Training) :\n"
+        f"\tTop-1 Accuracy             : {pruned_model_acc :0.2f}\n"
+        f"\tSparsity                   : {pruned_model_sparsity:0.2f}")
+
+    plot_model_weight_distribution(model)
+    gcf = plt.gcf()
+    gcf.suptitle(f"Weight distribution after finding individual param sparsities independently")
 
     import pdb
     pdb.set_trace()
@@ -420,4 +545,4 @@ if __name__ == "__main__":
     net = VGG()
     net.load_state_dict(torch.load(saved_model_file))
 
-    main(net)
+    main(net, os.path.dirname(saved_model_file))
