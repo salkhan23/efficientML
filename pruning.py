@@ -290,6 +290,30 @@ def plot_num_params_distribution(model):
     plt.title("Number of parameters per layer")
 
 
+def get_model_sparsity(model):
+    """
+    Calculate the sparsity of a PyTorch model.
+
+    :param model:
+    :return:
+    """
+    model_sparsity = 0
+    total_param = 0
+
+    for name, param in model.named_parameters():
+        if param.ndim > 1:
+            n_param = param.numel()
+            model_sparsity += get_tensor_sparsity(param) * n_param
+
+            # print(f"Layer {name}: Sparsity {get_tensor_sparsity(param):0.2f}")
+            total_param += n_param
+
+    if total_param > 0:
+        model_sparsity = model_sparsity / total_param
+
+    return model_sparsity
+
+
 def main(model):
     """
 
@@ -307,20 +331,25 @@ def main(model):
     train_data_set, train_loader, test_data_set, test_loader, _ = (
         train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
 
-    full_model_acc = 81.06
-    # full_model_acc = train_cifar10.evaluate(model, test_loader, device)
+    model_acc = 81.06
+    # model_acc = train_cifar10.evaluate(model, test_loader, device)
 
     # Dense Model Details
     print(f"Model: {model.__class__.__name__}")
 
     n_params = get_model_num_parameters(model)
     model_size = get_model_size(model)
+    model_sparsity = get_model_sparsity(model)
     print(
-        f"Dense Model Acc {full_model_acc:0.2f}, Model Size {model_size / MB:0.2f}MB. "
-        f"Number of parameters {n_params} ")
+        f"Dense Model Details :\n"
+        f"\tTop-1 Accuracy             : { model_acc :0.2f}\n"
+        f"\tNumber of parameters       : {n_params}\n"
+        f"\tSize                       : {model_size / MB:0.2f}MB\n"
+        f"\tSparsity                   : {model_sparsity:0.2f}")
+
     plot_model_weight_distribution(model)
     gcf = plt.gcf()
-    gcf.suptitle("Dense Model Weight Distribution")
+    gcf.suptitle("Dense model weight distribution")
 
     # # Prune a random layer # ------------------------------------------------------------------------
     # layer_to_prune = "backbone.conv1"
@@ -359,14 +388,16 @@ def main(model):
 
     print(f"Sensitivity scan complete. Took {datetime.now() - start_time}")
 
-    # Plot pruning results - single plot
-    plot_sensitivity_scan_results_single_plot(sparsity_range, acc_per_layer, layer_name_list, full_model_acc)
-    plot_sensitivity_scan_results_individual_layers(sparsity_range, acc_per_layer, layer_name_list, full_model_acc)
+    # Plot pruning results
+    plot_sensitivity_scan_results_single_plot(sparsity_range, acc_per_layer, layer_name_list, model_acc)
+    plot_sensitivity_scan_results_individual_layers(sparsity_range, acc_per_layer, layer_name_list, model_acc)
 
     # PLot the number of parameters per layer
     plot_num_params_distribution(model)
 
     # Given a minimum performance, and a target sparsity ratio. Find the sparsity ratio of each layer
+    target_model_sparsity = 0.75  # n_zeros/ n_weights
+    min_performance_drop = 0.05  # Max drop in performance allowed
 
     import pdb
     pdb.set_trace()
