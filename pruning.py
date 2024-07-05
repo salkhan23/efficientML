@@ -8,9 +8,11 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import copy
 import pickle
+from tqdm import tqdm
+import torch.nn as nn
+import torch.optim as optim
 
 import torch
-import torchvision
 
 import train_cifar10
 from vgg import VGG
@@ -379,14 +381,58 @@ def find_layer_sparsity_ratios(
 
                 # check if the target sparsity for the whole model is met, exit if it is
                 new_model_sparsity = estimate_total_sparsity(target_sparsities, n_params_dict)
-                print(f"After pruning layer '{name}' to sparsity {target_sparsities[name]:0.2f}. "
-                      f"Total Model Sparsity {new_model_sparsity:0.2f}")
+                print(f"\tLayer'{name}' sparsity  = {target_sparsities[name]:0.2f}. "
+                      f"[Total Model Sparsity {new_model_sparsity:0.2f}]")
 
                 if new_model_sparsity >= target_model_sparsity:
                     print(f"Target Model Sparsity {target_model_sparsity:0.2f} Achieved")
                     break
 
     return target_sparsities
+
+
+def fine_tune_model(model, device, train_loader, n_epochs, criterion, optimizer, lr_scheduler, pruning_cb):
+    """
+    Fine-tune a given model on a specified device using a training data loader.
+
+    :param model:
+    :param device:
+    :param train_loader: DataLoader for the training dataset.
+    :param n_epochs: Number of epochs to train the model.
+    :param criterion: Loss function used for training.
+    :param optimizer: Optimization algorithm used for training.
+    :param lr_scheduler: Learning rate scheduler.
+    :param pruning_cb: Callback function that applies a previously calculated pruning mask to maintain sparsity.
+
+    :return:
+    """
+    model.to(device)
+    # model.train()
+
+    for epoch in range(n_epochs):
+
+        epoch_loss = 0
+
+        for b_idx, (data, labels) in tqdm(
+                enumerate(train_loader), total=len(train_loader), desc=f'Epoch {epoch + 1}/{n_epochs}', leave=False):
+
+            data = data.to(device)
+            labels = labels.to(device)
+
+            model_out = model(data)
+
+            loss = criterion(model_out, labels)
+            epoch_loss += loss.item()
+
+            optimizer.zero_grad()   # zero any previous gradients before backward pass
+            loss.backward()         # Compute the gradients of the loss with respect to model parameters
+            optimizer.step()        # Update the model parameters based on the computed gradients
+
+            pruning_cb(model)  # Apply the pruning mask to keep the model sparse after training,
+
+        lr_scheduler.step()  # Drop learning rate according to lr scheduler, after each epoch
+
+        print(f'Epoch [{epoch + 1}/{n_epochs}], Loss: {epoch_loss / len(train_loader):.4f}')
 
 
 def main(model, results_store_dir):
@@ -406,10 +452,11 @@ def main(model, results_store_dir):
     train_data_set, train_loader, test_data_set, test_loader, _ = (
         train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
 
-    model_acc = 81.06
-    # model_acc = train_cifar10.evaluate(model, test_loader, device)
+    # model_acc = 81.06
+    model_acc = train_cifar10.evaluate(model, test_loader, device)
 
     # Dense Model Details
+    print(f"{'*' * 80}")
     print(f"Model: {model.__class__.__name__}")
 
     n_params = get_model_num_parameters(model)
@@ -456,6 +503,7 @@ def main(model, results_store_dir):
     # gcf.suptitle(f"Weight distribution After pruning with fix sparsity {sparsity}")
 
     # Different sparsity ratio for each layer  -----------------------------------------------------
+    print(f"{'*'*80}")
     sensitivity_scan_results_filename = 'sensitivity_results.pickle'
     sensitivity_scan_results_file = os.path.join(results_store_dir, sensitivity_scan_results_filename)
 
@@ -496,8 +544,9 @@ def main(model, results_store_dir):
     target_model_sparsity = 0.75  # n_zeros/ n_weights
     max_performance_drop = 5  # Max drop in performance allowed (max accuracy = 100%)
 
-    print(f"Finding model sparsity ratios to get a total sparsity of {target_model_sparsity:0.2f}. "
-          f"Max Allowed performance Drop {max_performance_drop:0.2f}")
+    print(f"{'*' * 80}")
+    print(f"Finding layer sparsity ratios to get a model with sparsity of {target_model_sparsity:0.2f}. "
+          f"\nMax allowed performance Drop {max_performance_drop:0.2f}")
 
     sparse_dict = find_layer_sparsity_ratios(
         target_model_sparsity,
@@ -510,19 +559,50 @@ def main(model, results_store_dir):
     )
 
     print(f"Pruning Model ...")
-    FineGrainPruner(model, sparse_dict)
+    pruner = FineGrainPruner(model, sparse_dict)
     with torch.no_grad():
         pruned_model_acc = train_cifar10.evaluate(model, test_loader, device)
     pruned_model_sparsity, _, _ = get_model_sparsity(model)
 
     print(
-        f"Pruned Model Details (no fine Training) :\n"
+        f"Pruned Model Details (after pruning) :\n"
         f"\tTop-1 Accuracy             : {pruned_model_acc :0.2f}\n"
         f"\tSparsity                   : {pruned_model_sparsity:0.2f}")
 
     plot_model_weight_distribution(model)
     gcf = plt.gcf()
     gcf.suptitle(f"Weight distribution after finding individual param sparsities independently")
+
+    # Fine Tune Pruned Model ----------------------------------------------------------------
+    lr = 1e-3  # 1/100th of training lr
+    n_epochs = 5
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-2)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+
+    print(f"{'*' * 80}")
+    print(f"Fine Tuning Model [lr={lr}, n_epochs ={n_epochs}] ... ")
+
+    fine_tune_model(
+        model=model,
+        device=device,
+        train_loader=train_loader,
+        n_epochs=n_epochs,
+        criterion=criterion,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        pruning_cb=pruner.apply_masks
+    )
+
+    with torch.no_grad():
+        pruned_model_acc = train_cifar10.evaluate(model, test_loader, device)
+    pruned_model_sparsity, _, _ = get_model_sparsity(model)
+
+    print(
+        f"Pruned Model Details (after fine tuning) :\n"
+        f"\tTop-1 Accuracy             : {pruned_model_acc :0.2f}\n"
+        f"\tSparsity                   : {pruned_model_sparsity:0.2f}")
 
     import pdb
     pdb.set_trace()
