@@ -435,15 +435,23 @@ def fine_tune_model(model, device, train_loader, n_epochs, criterion, optimizer,
         print(f'Epoch [{epoch + 1}/{n_epochs}], Loss: {epoch_loss / len(train_loader):.4f}')
 
 
-def main(model, results_store_dir):
+def main(model, dense_model_weights_file):
     """
     :param model: Trained model
-    :param results_store_dir:
+    :param dense_model_weights_file:
     :return:
     """
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # load the model
+    if not os.path.exists(dense_model_weights_file):
+        raise FileNotFoundError(f"Cannot find stored model file {dense_model_weights_file}")
+
+    net.load_state_dict(torch.load(dense_model_weights_file))
     model.to(device)
+
+    results_store_dir = os.path.dirname(saved_model_file)
 
     b_size = 128
     data_dir = './data'
@@ -467,7 +475,9 @@ def main(model, results_store_dir):
         f"\tTop-1 Accuracy             : { model_acc :0.2f}\n"
         f"\tNumber of parameters       : {n_params}\n"
         f"\tSize                       : {model_size / MB:0.2f}MB\n"
-        f"\tSparsity                   : {model_sparsity:0.2f}")
+        f"\tSparsity                   : {model_sparsity:0.2f}\n"
+        f"\tWeights file size          : {os.path.getsize(dense_model_weights_file) / MB:0.3f} MB"
+    )
 
     plot_model_weight_distribution(model)
     gcf = plt.gcf()
@@ -575,7 +585,7 @@ def main(model, results_store_dir):
 
     # Fine Tune Pruned Model ----------------------------------------------------------------
     lr = 1e-3  # 1/100th of training lr
-    n_epochs = 5
+    n_epochs = 1
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-2)
@@ -599,10 +609,36 @@ def main(model, results_store_dir):
         pruned_model_acc = train_cifar10.evaluate(model, test_loader, device)
     pruned_model_sparsity, _, _ = get_model_sparsity(model)
 
+    # Space Savings -----------------------------------------------------------------------------
+    # use pytorch's to_sparse method to save sparse weights compactly
+    sparse_state_dict = {k: v.to_sparse() for k, v in model.state_dict().items()}
+    sparse_weights_file = os.path.join(results_store_dir, 'sparse_weights.pth')
+    torch.save(sparse_state_dict, sparse_weights_file)
+
     print(
         f"Pruned Model Details (after fine tuning) :\n"
         f"\tTop-1 Accuracy             : {pruned_model_acc :0.2f}\n"
-        f"\tSparsity                   : {pruned_model_sparsity:0.2f}")
+        f"\tSparsity                   : {pruned_model_sparsity:0.2f}\n"
+        f"\tSparse Weight file size    : {os.path.getsize(sparse_weights_file) / MB:0.3f} MB"
+    )
+
+    # load the saved model to see everything is working
+    reloaded_sparse_weights = torch.load(sparse_weights_file)
+    reloaded_dense_state_dict = {k: v.to_dense() for k, v in reloaded_sparse_weights.items()}
+
+    net2 = VGG()
+    net2.load_state_dict(reloaded_dense_state_dict)
+    net2.to(device)
+
+    with torch.no_grad():
+        reloaded_model_acc = train_cifar10.evaluate(net2, test_loader, device)
+    reloaded_model_sparsity, _, _ = get_model_sparsity(net2)
+
+    print(
+        f"Reloaded Sparse Model :\n"
+        f"\tTop-1 Accuracy             : {reloaded_model_acc :0.2f}\n"
+        f"\tSparsity                   : {reloaded_model_sparsity:0.2f}\n"
+    )
 
     import pdb
     pdb.set_trace()
@@ -618,11 +654,5 @@ if __name__ == "__main__":
 
     print(f"GPU is available? {torch.cuda.is_available()}")
 
-    # load the model
-    if not os.path.exists(saved_model_file):
-        raise FileNotFoundError(f"Cannot find stored model file {saved_model_file}")
-
     net = VGG()
-    net.load_state_dict(torch.load(saved_model_file))
-
-    main(net, os.path.dirname(saved_model_file))
+    main(net, saved_model_file)
