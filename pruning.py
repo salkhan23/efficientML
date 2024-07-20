@@ -585,7 +585,7 @@ def main(model, dense_model_weights_file):
 
     # Fine Tune Pruned Model ----------------------------------------------------------------
     lr = 1e-3  # 1/100th of training lr
-    n_epochs = 1
+    n_epochs = 5
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-2)
@@ -611,7 +611,13 @@ def main(model, dense_model_weights_file):
 
     # Space Savings -----------------------------------------------------------------------------
     # use pytorch's to_sparse method to save sparse weights compactly
-    sparse_state_dict = {k: v.to_sparse() for k, v in model.state_dict().items()}
+    sparse_state_dict = {}
+    for k, v in model.state_dict().items():
+        if k in sparse_dict and sparse_dict[k] > 0:
+            sparse_state_dict[k] = v.to_sparse()
+        else:
+            sparse_state_dict[k] = v
+
     sparse_weights_file = os.path.join(results_store_dir, 'sparse_weights.pth')
     torch.save(sparse_state_dict, sparse_weights_file)
 
@@ -624,7 +630,7 @@ def main(model, dense_model_weights_file):
 
     # load the saved model to see everything is working
     reloaded_sparse_weights = torch.load(sparse_weights_file)
-    reloaded_dense_state_dict = {k: v.to_dense() for k, v in reloaded_sparse_weights.items()}
+    reloaded_dense_state_dict = {k: v.to_dense() if v.is_sparse else v for k, v in reloaded_sparse_weights.items()}
 
     net2 = VGG()
     net2.load_state_dict(reloaded_dense_state_dict)
