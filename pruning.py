@@ -428,7 +428,8 @@ def fine_tune_model(model, device, train_loader, n_epochs, criterion, optimizer,
             loss.backward()         # Compute the gradients of the loss with respect to model parameters
             optimizer.step()        # Update the model parameters based on the computed gradients
 
-            pruning_cb(model)  # Apply the pruning mask to keep the model sparse after training,
+            if pruning_cb is not None:
+                pruning_cb(model)  # Apply the pruning mask to keep the model sparse after training,
 
         lr_scheduler.step()  # Drop learning rate according to lr scheduler, after each epoch
 
@@ -551,7 +552,7 @@ def main(model, dense_model_weights_file):
 
     # Given a min performance and a target sparsity ratio, find sparsity ratios of each layer
     # ---------------------------------------------------------------------------------------------
-    target_model_sparsity = 0.75  # n_zeros/ n_weights
+    target_model_sparsity = 0.90  # n_zeros/ n_weights
     max_performance_drop = 5  # Max drop in performance allowed (max accuracy = 100%)
 
     print(f"{'*' * 80}")

@@ -10,9 +10,11 @@ import os
 import copy
 import torch
 import torch.nn as nn
+import torch.optim as optim
 
 from vgg import VGG
 import train_cifar10
+import pruning
 
 
 @torch.no_grad()
@@ -34,7 +36,7 @@ def sort_channels_on_importance(model):
         """ Find the Euclidian norm of each input channel of a convolutional layer """
 
         squared_weight = weight ** 2
-        squared_sum = squared_weight.sum(dim=(0, 2, 3)) # dim 1 = input channels
+        squared_sum = squared_weight.sum(dim=(0, 2, 3))  # dim 1 = input channels
         imp = torch.sqrt(squared_sum)
 
         return imp
@@ -149,6 +151,33 @@ def main(model, dense_model_weights_file):
 
     pruned_model_acc = train_cifar10.evaluate(pruned_model, test_loader, device)
     print(f"Pruned Model Accuracy {pruned_model_acc:0.2f}")
+
+    # Fine Tune the Pruned Model
+    # Fine Tune Pruned Model ----------------------------------------------------------------
+    lr = 1e-3  # 1/100th of training lr
+    n_epochs = 5
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-2)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_epochs)
+
+    print(f"{'*' * 80}")
+    print(f"Fine Tuning Model [lr={lr}, n_epochs ={n_epochs}] ... ")
+
+    pruning.fine_tune_model(
+        model=model,
+        device=device,
+        train_loader=train_loader,
+        n_epochs=n_epochs,
+        criterion=criterion,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        pruning_cb=None
+    )
+
+    with torch.no_grad():
+        pruned_model_acc = train_cifar10.evaluate(model, test_loader, device)
+        print(f"Fine Tune Model Accuracy {pruned_model_acc:0.2f}")
 
     import pdb
     pdb.set_trace()
