@@ -71,6 +71,45 @@ def sort_channels_on_importance(model):
     return modified_model
 
 
+@torch.no_grad()
+def prune_model_channels(model, sparsity):
+    """
+     Prunes the channels of the convolutional and batch normalization layers of a model.
+
+    :param model: The model to prune.
+    :param sparsity: The fraction of channels to prune (between 0 and 1).
+    :return: The pruned model.
+    """
+    sparsity = min(max(0.0, sparsity), 1.0)
+
+    modified_model = copy.deepcopy(model)  # prevent overwrite
+
+    all_convs = [m for m in modified_model.backbone if isinstance(m, nn.Conv2d)]
+    all_bns = [m for m in modified_model.backbone if isinstance(m, nn.BatchNorm2d)]
+
+    for c_layer_idx in range(len(all_convs) - 1):
+        curr_conv = all_convs[c_layer_idx]
+        curr_bn = all_bns[c_layer_idx]
+        next_conv = all_convs[c_layer_idx + 1]
+
+        # Figure out the number of output channels to keep
+        n_ch_out, n_ch_in, n_r, n_c = curr_conv.weight.shape
+        n_ch_out_keep = int(np.round(n_ch_out * (1 - sparsity)))
+
+        curr_conv.weight.set_(curr_conv.weight.detach()[:n_ch_out_keep, ])  # output channels are removed
+
+        # Change the Batch Normalization layers as well
+        curr_bn.weight.set_(curr_bn.weight.detach()[:n_ch_out_keep, ])
+        curr_bn.bias.set_(curr_bn.bias.detach()[:n_ch_out_keep, ])
+        curr_bn.running_mean.set_(curr_bn.running_mean.detach()[:n_ch_out_keep,])
+        curr_bn.running_var.set_(curr_bn.running_var.detach()[:n_ch_out_keep, ])
+
+        # Change the input dimensions of the next convolutional layer
+        next_conv.weight.set_(next_conv.weight.detach()[:, :n_ch_out_keep, ])
+
+    return modified_model
+
+
 def main(model, dense_model_weights_file):
     """
 
@@ -103,6 +142,13 @@ def main(model, dense_model_weights_file):
 
     sorted_model_acc = train_cifar10.evaluate(model, test_loader, device)
     print(f"Sorted Model Accuracy {sorted_model_acc:0.2f}")
+
+    # Prune the Channels according to  a sparsity ratio
+    sparsity = 0.3
+    pruned_model = prune_model_channels(sorted_model, sparsity)
+
+    pruned_model_acc = train_cifar10.evaluate(pruned_model, test_loader, device)
+    print(f"Pruned Model Accuracy {pruned_model_acc:0.2f}")
 
     import pdb
     pdb.set_trace()
