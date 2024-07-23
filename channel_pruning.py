@@ -8,9 +8,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import copy
+from time import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torchprofile import profile_macs
 
 from vgg import VGG
 import train_cifar10
@@ -139,6 +141,7 @@ def main(model, dense_model_weights_file):
     dense_model_acc = train_cifar10.evaluate(model, test_loader, device)
     print(f"Dense Model Accuracy {dense_model_acc:0.2f}")
 
+    # Channel Pruning ------------------------------------------------------------------------
     # Sort channels according to importance, to make it easier to prune
     sorted_model = sort_channels_on_importance(model)
 
@@ -152,7 +155,6 @@ def main(model, dense_model_weights_file):
     pruned_model_acc = train_cifar10.evaluate(pruned_model, test_loader, device)
     print(f"Pruned Model Accuracy {pruned_model_acc:0.2f}")
 
-    # Fine Tune the Pruned Model
     # Fine Tune Pruned Model ----------------------------------------------------------------
     lr = 1e-3  # 1/100th of training lr
     n_epochs = 5
@@ -175,9 +177,57 @@ def main(model, dense_model_weights_file):
         pruning_cb=None
     )
 
-    with torch.no_grad():
-        pruned_model_acc = train_cifar10.evaluate(model, test_loader, device)
-        print(f"Fine Tune Model Accuracy {pruned_model_acc:0.2f}")
+    pruned_model_acc = train_cifar10.evaluate(model, test_loader, device)
+    print(f"Fine Tune Model Accuracy {pruned_model_acc:0.2f}")
+
+    # Show improvements due to Pruning  ---------------------------------------------------
+    # Model Size Reduction
+    dense_model_size = pruning.get_model_size(model)
+    pruned_model_size = pruning.get_model_size(pruned_model)
+    print(
+        f"Dense model size {dense_model_size/pruning.MB:0.2f}. Pruned Model Size {pruned_model_size/pruning.MB:0.2f}. "
+        f"Reduction {pruned_model_size/dense_model_size * 100:0.2f}%")
+
+    image_idx = int(torch.rand(1) * len(test_data_set.data))
+    test_image = test_data_set.data[image_idx]
+    test_image = torch.from_numpy(test_image).float()  # Model expects a float time
+    test_image = torch.permute(test_image, (2, 0, 1))  # channel first
+    test_image = test_image.unsqueeze(dim=0)  # Add batch dimension
+    test_image = test_image.to(device)
+
+    print(f"Testing using image @ index {image_idx}")
+
+    # Model MAC reduction Multiply and accumulate operations
+    dense_model_mac = profile_macs(model, test_image)
+    prune_model_mac = profile_macs(pruned_model, test_image)
+
+    print(
+        f"Dense  model MACs {dense_model_mac / 1e6:0.2f}, "
+        f"Pruned Model MACs {prune_model_mac / 1e6:0.2f}. "
+        f"Reduction {prune_model_mac / dense_model_mac * 100:0.2f} %")
+
+    # Timing Improvement
+    @torch.no_grad()
+    def measure_latency(model1, input1, n_warmup=20, n_test=100):
+        model1.eval()
+        # warmup  - Eliminate any setup latency issue
+        for _ in range(n_warmup):
+            _ = model1(input1)
+        # real test
+        t1 = time()
+        for _ in range(n_test):
+            _ = model1(input1)
+        t2 = time()
+
+        return (t2 - t1) / n_test  # average latency
+
+    dense_model_latency = measure_latency(model, test_image)
+    prune_model_latency = measure_latency(pruned_model, test_image)
+
+    print(
+        f"Dense model latency {dense_model_latency*1000:0.2f} ms. "
+        f"Pruned Model MACs {prune_model_latency*1000:0.2f} ms. "
+        f"Reduction {(dense_model_latency - prune_model_latency) / dense_model_latency * 100:0.2f} %")
 
     import pdb
     pdb.set_trace()
