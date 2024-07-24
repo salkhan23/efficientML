@@ -622,6 +622,23 @@ def main(model, dense_model_weights_file):
     sparse_weights_file = os.path.join(results_store_dir, 'sparse_weights.pth')
     torch.save(sparse_state_dict, sparse_weights_file)
 
+    #  use pytorch's to_sparse method to save sparse weights compactly
+    sparse_state_dict = {}
+    for k, v in model.state_dict().items():
+        if k in sparse_dict and sparse_dict[k] > 0:
+            # Save the tensor as flattened 1D, convert to sparse
+            v_flattened = v.flatten()
+            v_sparse = v_flattened.to_sparse()
+            sparse_state_dict[k] = {
+                'shape': v.shape,
+                'v_sparse': v_sparse
+            }
+        else:
+            sparse_state_dict[k] = v
+
+    sparse_weights_file = os.path.join(results_store_dir, 'sparse_weights.pth')
+    torch.save(sparse_state_dict, sparse_weights_file)
+
     print(
         f"Pruned Model Details (after fine tuning) :\n"
         f"\tTop-1 Accuracy             : {pruned_model_acc :0.2f}\n"
@@ -630,8 +647,18 @@ def main(model, dense_model_weights_file):
     )
 
     # load the saved model to see everything is working
-    reloaded_sparse_weights = torch.load(sparse_weights_file)
-    reloaded_dense_state_dict = {k: v.to_dense() if v.is_sparse else v for k, v in reloaded_sparse_weights.items()}
+    sparse_state_dict = torch.load(sparse_weights_file)
+    reloaded_dense_state_dict = {}
+
+    for k, v in sparse_state_dict.items():
+        if isinstance(v, dict) and 'v_sparse' in v:
+            # If the weight is sparse
+            sparse_tensor = v['v_sparse'].to_dense()
+            shape = tuple(v['shape'])
+            reloaded_dense_state_dict[k] = torch.reshape(sparse_tensor, shape)
+        else:
+            # If the weight is dense
+            reloaded_dense_state_dict[k] = v
 
     net2 = VGG()
     net2.load_state_dict(reloaded_dense_state_dict)
