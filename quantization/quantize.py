@@ -1,8 +1,11 @@
 import torch
+from fast_pytorch_kmeans import KMeans
 
 
 def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4):
     """
+    k-means clustering on a floating-point tensor.
+
     :param fp32_tensor: floating point tensor to quantize
     :param k: Number of clusters
     :param max_iter: maximum number of iteration to find cluster centers
@@ -50,25 +53,25 @@ def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4):
     print(f"Final Centroids; {centroids}")
 
     return centroids
-
-
-def k_means_quantize(fp32_tensor: torch.Tensor, codebook=None,  bit_width=4):
-    """
-    quantize tensor using k-means clustering
-
-    :param fp32_tensor:
-    :param bit_width: [int] quantization bit width, default=4
-    :param codebook: [Codebook] (the cluster centroids, the cluster label tensor)
-    :return:
-        [Codebook = (centroids, labels)]
-            centroids: [torch.(cuda.)FloatTensor] the cluster centroids
-            labels: [torch.(cuda.)LongTensor] cluster label tensor
-    """
-    if codebook is None:
-        # Create a new codebook with centroids and their labels
-        n_levels = 2**bit_width
-
-        codebook = k_means_cluster(fp32_tensor, n_levels)
+#
+#
+# def k_means_quantize(fp32_tensor: torch.Tensor, codebook=None,  bit_width=4):
+#     """
+#     quantize tensor using k-means clustering
+#
+#     :param fp32_tensor:
+#     :param bit_width: [int] quantization bit width, default=4
+#     :param codebook: [Codebook] (the cluster centroids, the cluster label tensor)
+#     :return:
+#         [Codebook = (centroids, labels)]
+#             centroids: [torch.(cuda.)FloatTensor] the cluster centroids
+#             labels: [torch.(cuda.)LongTensor] cluster label tensor
+#     """
+#     if codebook is None:
+#         # Create a new codebook with centroids and their labels
+#         n_levels = 2**bit_width
+#
+#         codebook = k_means_cluster(fp32_tensor, n_levels)
 
 
 if __name__ == "__main__":
@@ -82,9 +85,19 @@ if __name__ == "__main__":
         [-0.1592, -0.0777, -0.3946, -0.2128,  0.2675],
         [ 0.0611, -0.1933, -0.4350,  0.2928, -0.1087]])
 
-    k_means_quantize(test_tensor, bit_width=2)
+    bit_width = 2
+    n_clusters = 2**bit_width
 
+    cluster_centers = k_means_cluster(test_tensor, k=n_clusters)
+    print(f"Centroids Manual        : {cluster_centers}")
 
+    # Use library function
+    kmeans = KMeans(n_clusters=n_clusters, mode='euclidean', verbose=0)
+    labels = kmeans.fit_predict(test_tensor.view(-1, 1)).to(torch.long)
+    cluster_centers = kmeans.centroids.to(torch.float).view(-1)
+    cluster_centers = torch.sort(cluster_centers)[0]
+
+    print(f"Centroids Using Library : {cluster_centers}")
 
 
 
