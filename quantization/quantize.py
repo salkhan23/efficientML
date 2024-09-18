@@ -1,27 +1,36 @@
 import torch
 
 
-def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100):
+def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4):
+    """
+    :param fp32_tensor: floating point tensor to quantize
+    :param k: Number of clusters
+    :param max_iter: maximum number of iteration to find cluster centers
+    :param tol:
+    :return: centroids
+    """
 
     tensor_flat = fp32_tensor.flatten()
     num_el = len(tensor_flat)
 
-    prob = torch.tensor([1/num_el]*num_el, dtype=torch.float)
-
-    centroids_idxs = torch.multinomial(prob, k, replacement=False)
+    # Randomly select k starting cluster centers
+    centroids_idxs = torch.randint(0, num_el, (k,))
     centroids = tensor_flat[centroids_idxs]
     centroids = torch.sort(centroids)[0]
+    print(f"Starting Centroids: {centroids}")
 
-    tensor_flat = tensor_flat.unsqueeze(-1)  # Expand dim by 1, allow broadcasting to do element wise subtraction
+    prev_centroids = centroids.clone()
+
+    # Expand dim by 1, allow broadcasting to do element wise subtraction
     for iter_idx in range(max_iter):
-        dist = abs(tensor_flat - centroids)
+        dist = abs(tensor_flat.unsqueeze(-1) - centroids)
         closest_centroids = torch.argmin(dist, dim=-1)
 
         group_sums = torch.zeros_like(centroids)
         group_counts = torch.zeros_like(centroids)
         for i, centroid_idx in enumerate(closest_centroids):
 
-            group_sums[centroid_idx] += tensor_flat[i,0]
+            group_sums[centroid_idx] += tensor_flat[i]
             group_counts[centroid_idx] += 1
 
         # Update centroids by the mean of each cluster
@@ -29,13 +38,18 @@ def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100):
             if group_counts[g_idx] != 0:
                 centroids[g_idx] = group_sums[g_idx] / group_counts[g_idx]
 
-        print(centroids)
+        print(f"{iter_idx}: centroids {centroids}. Dist with Prev: {torch.abs(prev_centroids - centroids).sum()}")
 
+        if torch.abs(prev_centroids - centroids).sum() < 1e-4:
+            print(f"Converged after {iter_idx + 1} iterations")
+            break
 
-    import pdb
-    pdb.set_trace()
+        prev_centroids = centroids.clone()
 
-    return 0
+    centroids = torch.sort(centroids)[0]
+    print(f"Final Centroids; {centroids}")
+
+    return centroids
 
 
 def k_means_quantize(fp32_tensor: torch.Tensor, codebook=None,  bit_width=4):
@@ -56,9 +70,6 @@ def k_means_quantize(fp32_tensor: torch.Tensor, codebook=None,  bit_width=4):
 
         codebook = k_means_cluster(fp32_tensor, n_levels)
 
-        import pdb
-        pdb.set_trace()
-
 
 if __name__ == "__main__":
     random_seed = 10
@@ -71,7 +82,7 @@ if __name__ == "__main__":
         [-0.1592, -0.0777, -0.3946, -0.2128,  0.2675],
         [ 0.0611, -0.1933, -0.4350,  0.2928, -0.1087]])
 
-    k_means_quantize(test_tensor,bit_width=2)
+    k_means_quantize(test_tensor, bit_width=2)
 
 
 
