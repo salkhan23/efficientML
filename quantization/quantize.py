@@ -1,15 +1,26 @@
+import os
+import sys
 import torch
 from fast_pytorch_kmeans import KMeans
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
 
-def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4):
+from vgg import VGG  # noqa: E402  (ignore module import not at top)
+import train_cifar10 # noqa: E402  (ignore module import not at top)
+
+
+def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4, verbose=False):
     """
     k-means clustering on a floating-point tensor.
+
 
     :param fp32_tensor: floating point tensor to quantize
     :param k: Number of clusters
     :param max_iter: maximum number of iteration to find cluster centers
     :param tol:
+    :param verbose:
     :return: centroids
     """
 
@@ -20,7 +31,8 @@ def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4):
     centroids_idxs = torch.randint(0, num_el, (k,))
     centroids = tensor_flat[centroids_idxs]
     centroids = torch.sort(centroids)[0]
-    print(f"Starting Centroids: {centroids}")
+    if verbose:
+        print(f"Starting Centroids: {centroids}")
 
     prev_centroids = centroids.clone()
 
@@ -41,16 +53,18 @@ def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4):
             if group_counts[g_idx] != 0:
                 centroids[g_idx] = group_sums[g_idx] / group_counts[g_idx]
 
+        # if verbose:
         print(f"{iter_idx}: centroids {centroids}. Dist with Prev: {torch.abs(prev_centroids - centroids).sum()}")
 
-        if torch.abs(prev_centroids - centroids).sum() < 1e-4:
+        if torch.abs(prev_centroids - centroids).sum() < tol:
             print(f"Converged after {iter_idx + 1} iterations")
             break
 
         prev_centroids = centroids.clone()
 
     centroids = torch.sort(centroids)[0]
-    print(f"Final Centroids; {centroids}")
+    if verbose:
+        print(f"Final Centroids; {centroids}")
 
     return centroids
 
@@ -76,6 +90,29 @@ def k_means_quantize(fp32_tensor: torch.Tensor, centroids, inplace=True):
         fp32_tensor.copy_(quantized_tensor)
 
     return quantized_tensor
+
+
+class KMeansModelQuantizer:
+    def __init__(self, model, bit_width=4):
+        self.codebook = self.quantize(model, bit_width)
+
+    @staticmethod
+    @torch.no_grad()
+    def quantize(model, bit_width):
+
+        codebook = {}  # dictionary of param name = centroids
+
+        if isinstance(bit_width, dict):  # Quantize named layers
+            for name, param in model.named_parameters():
+                if name in bit_width:
+                    codebook[name] = k_means_cluster(param, k=2**bit_width[name])
+        else:
+            for name, param in model.named_parameters():
+                if param.dim() > 1:
+                    print(f"Quantizing {name}")
+                    codebook[name] = k_means_cluster(param, k=2**bit_width)
+
+        return codebook
 
 
 if __name__ == "__main__":
@@ -109,6 +146,32 @@ if __name__ == "__main__":
     print(f"Centroids Using Library  : {torch.reshape(kmeans.centroids, (1, -1))}")
     print(f"Note that the library does not use ordered centroids (quantized indexes may not match)")
     print(quantized_test_tensor)
-   
+
+    # ---------------------------------------------------------------------------------------
+    # Quantize full model
+    # ---------------------------------------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    saved_model_file = "../results_trained_models/07-06-2024_VGG_net_train_epochs_100_acc_81.pth"
+
+    net = VGG()
+    net.load_state_dict(torch.load(saved_model_file))
+    net.to(device)
+
+    b_size = 128
+    data_dir = './data'
+
+    train_data_set, train_loader, test_data_set, test_loader, _ = (
+        train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
+
+    model_acc = train_cifar10.evaluate(net, test_loader, device)
+    print(f"Floating point Model  accuracy {model_acc:0.2f}")
+
+    quantization_size = 8
+    KMeansModelQuantizer(net, quantization_size)
+
+    model_acc = train_cifar10.evaluate(net, test_loader, device)
+    print(f"{quantization_size}-bit quantized Model  accuracy {model_acc:0.2f}")
+
     import pdb
     pdb.set_trace()
