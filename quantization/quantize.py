@@ -164,8 +164,7 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------------------
     # Quantize full model
     # ---------------------------------------------------------------------------------------
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = 'cpu'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     saved_model_file = "../results_trained_models/07-06-2024_VGG_net_train_epochs_100_acc_81.pth"
 
@@ -182,11 +181,17 @@ if __name__ == "__main__":
     model_acc = train_cifar10.evaluate(net, test_loader, device)
     print(f"Floating point Model  accuracy {model_acc:0.2f}")
 
-    quantization_size = 8
-    KMeansModelQuantizer(net, quantization_size)
+    quantization_sizes = [2, 4, 8]
 
-    model_acc = train_cifar10.evaluate(net, test_loader, device)
-    print(f"{quantization_size}-bit quantized Model  accuracy {model_acc:0.2f}")
+    for q_size in quantization_sizes:
+        net = net.to('cpu')
+        KMeansModelQuantizer(net, q_size)
+        net = net.to('cuda')
+
+        model_acc = train_cifar10.evaluate(net, test_loader, device)
+        print(f"{q_size}-bit quantized Model  accuracy {model_acc:0.2f}")
+
+        net.load_state_dict(torch.load(saved_model_file))
 
     import pdb
     pdb.set_trace()
