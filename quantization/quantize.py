@@ -8,7 +8,7 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
 from vgg import VGG  # noqa: E402  (ignore module import not at top)
-import train_cifar10 # noqa: E402  (ignore module import not at top)
+import train_cifar10  # noqa: E402  (ignore module import not at top)
 
 
 def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4, verbose=False):
@@ -92,6 +92,19 @@ def k_means_quantize(fp32_tensor: torch.Tensor, centroids, inplace=True):
     return quantized_tensor
 
 
+def k_means_cluster_fast(fp32_tensor, bit_width):
+    """ Fast Kmeans Cluster using fast_pytorch_kmeans library"""
+    num_clusters = 2 ** bit_width
+    kmeans1 = KMeans(n_clusters=num_clusters, mode='euclidean', verbose=0)
+    w_q_flat = kmeans1.fit_predict(fp32_tensor.view(-1, 1))
+
+    # replace w with quantized w and store the centroids in a codebook
+    fp32_tensor.copy_(w_q_flat.view_as(fp32_tensor))
+    # Store centroids in codebook dictionary
+
+    return kmeans1.centroids
+
+
 class KMeansModelQuantizer:
     def __init__(self, model, bit_width=4):
         self.codebook = self.quantize(model, bit_width)
@@ -102,15 +115,16 @@ class KMeansModelQuantizer:
 
         codebook = {}  # dictionary of param name = centroids
 
-        if isinstance(bit_width, dict):  # Quantize named layers
+        if isinstance(bit_width, dict):  # Quantize named layers with specified bit width
             for name, param in model.named_parameters():
                 if name in bit_width:
-                    codebook[name] = k_means_cluster(param, k=2**bit_width[name])
+                    print(f"Quantizing {name}")
+                    codebook[name] = k_means_cluster_fast(param, bit_width[name])
         else:
             for name, param in model.named_parameters():
                 if param.dim() > 1:
                     print(f"Quantizing {name}")
-                    codebook[name] = k_means_cluster(param, k=2**bit_width)
+                    codebook[name] = k_means_cluster_fast(param, bit_width)
 
         return codebook
 
@@ -150,7 +164,8 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------------------
     # Quantize full model
     # ---------------------------------------------------------------------------------------
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = 'cpu'
 
     saved_model_file = "../results_trained_models/07-06-2024_VGG_net_train_epochs_100_acc_81.pth"
 
