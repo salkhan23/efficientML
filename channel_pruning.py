@@ -16,6 +16,7 @@ from torchprofile import profile_macs
 
 from vgg import VGG
 import train_cifar10
+import model_analysis_utils
 import pruning
 
 
@@ -182,10 +183,11 @@ def main(model, dense_model_weights_file):
 
     # Show improvements due to Pruning  ---------------------------------------------------
     # Model Size Reduction
-    dense_model_size = pruning.get_model_size(model)
-    pruned_model_size = pruning.get_model_size(pruned_model)
+    dense_model_size = model_analysis_utils.get_model_size(model)
+    pruned_model_size = model_analysis_utils.get_model_size(pruned_model)
     print(
-        f"Dense model size {dense_model_size/pruning.MB:0.2f}. Pruned Model Size {pruned_model_size/pruning.MB:0.2f}. "
+        f"Dense model size {dense_model_size/model_analysis_utils.MB:0.2f}. Pruned Model Size "
+        f"{pruned_model_size/model_analysis_utils.MB:0.2f}. "
         f"Reduction {pruned_model_size/dense_model_size * 100:0.2f}%")
 
     image_idx = int(torch.rand(1) * len(test_data_set.data))
