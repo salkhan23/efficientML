@@ -9,6 +9,7 @@ sys.path.append(parent_dir)
 
 from vgg import VGG  # noqa: E402  (ignore module import not at top)
 import train_cifar10  # noqa: E402  (ignore module import not at top)
+import model_analysis_utils # noqa: E402  (ignore module import not at top)
 
 
 def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4, verbose=False):
@@ -189,7 +190,8 @@ if __name__ == "__main__":
         net = net.to('cuda')
 
         model_acc = train_cifar10.evaluate(net, test_loader, device)
-        print(f"{q_size}-bit quantized Model  accuracy {model_acc:0.2f}")
+        model_size = model_analysis_utils.get_model_size(net, q_size) / model_analysis_utils.MB
+        print(f"{q_size}-bit quantized Model: Accuracy {model_acc:0.2f}, Size {model_size:0.2f} MB")
 
         net.load_state_dict(torch.load(saved_model_file))
 
