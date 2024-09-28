@@ -119,7 +119,60 @@ def save_model(model, best_model_state_dict, save_dir, best_test_acc, n_epochs):
     print(f'Model saved to {save_file_path}')
 
 
-def main(b_size, random_seed=10, data_dir='./data', save_dir='./results_trained_models', n_epochs=10, lr=1e-2):
+def train(
+        model, dataloader, criterion, optimizer, scheduler, callbacks=None):
+    """
+    Train model for one epoch.
+
+    :param model: nn.Module - The neural network model to train.
+    :param dataloader: DataLoader - The dataloader providing training data.
+    :param criterion: nn.Module - The loss function used for optimization.
+    :param optimizer: optim.Optimizer - The optimizer for training the model.
+    :param scheduler: LambdaLR - The learning rate scheduler for updating the learning rate.
+    :param callbacks: list, optional - A list of callback functions to be called during training (default: None).
+    :return: None
+    """
+    model.train()
+
+    n_samples = 0
+    n_correct = 0
+    train_acc = 0
+
+    for inputs, targets in tqdm(dataloader, desc='train', leave=False):
+        # Move the data from CPU to GPU
+        inputs = inputs.cuda()
+        targets = targets.cuda()
+
+        # Reset the gradients (from the last iteration)
+        optimizer.zero_grad()
+
+        # Forward pass
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+
+        # Backward propagation
+        loss.backward()
+
+        # Update optimizer and LR scheduler
+        optimizer.step()
+        scheduler.step()
+
+        # Train accuracy
+        predictions = torch.argmax(outputs, dim=1)
+        n_samples += targets.size(0)
+        n_correct += (predictions == targets).sum()
+
+        # Execute any provided callbacks
+        if callbacks is not None:
+            for callback in callbacks:
+                callback()
+
+        train_acc = n_correct / n_samples * 100
+
+    return train_acc
+
+
+def main(b_size, random_seed=10, data_dir='./data', save_dir=None, n_epochs=10, lr=1e-2):
 
     np.random.seed(random_seed)
     torch.random.manual_seed(random_seed)
@@ -159,66 +212,53 @@ def main(b_size, random_seed=10, data_dir='./data', save_dir='./results_trained_
     best_test_acc = 0
     best_model = None
 
+    # Track  the best model and accuracy
+    best_model_state = None
+    best_test_acc = 0.0
+
+    # Start timer for training duration
+    training_start_time = datetime.now()
+
+    print(f"Starting Training for {n_epochs} epochs")
+
+    test_acc = 0
+    train_acc = 0
+
+    # Training Loop for each epoch
     for epoch in range(n_epochs):
+        print(f"Epoch {epoch + 1}/{n_epochs}. Starting accuracies: Train={train_acc:0.2f}, Test={test_acc:0.2f}")
 
-        running_loss = 0.0
-        epoch_start_time = datetime.now()
-        n_samples = 0
-        n_correct = 0
+        # Train the model for one epoch using the train function
+        train_acc = train(
+            model=net,
+            dataloader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=lr_scheduler,
+            callbacks=None
+        )
 
-        for b_idx, (data, labels) in \
-                tqdm(enumerate(train_loader, 0), total=len(train_loader), desc=f'Epoch {epoch+1}/{n_epochs}'):
-
-            data = data.to(device)
-            labels = labels.to(device)
-
-            model_out = net(data)
-
-            # Compute the loss using the raw outputs and the true labels
-            loss = criterion(model_out, labels)
-
-            # Zero the gradients before backward pass
-            optimizer.zero_grad()
-            # Backward pass: compute the gradients of the loss with respect to model parameters
-            loss.backward()
-            # Update the model parameters based on the computed gradients
-            optimizer.step()
-
-            # Train Acc
-            predictions = torch.argmax(model_out, dim=1)
-            n_samples += labels.size(0)
-            n_correct += (predictions == labels).sum()
-
-            running_loss += loss.item()
-            if b_idx % 2000 == 1999:  # print every 2000 mini-batches
-                print(f'[{epoch + 1}, {b_idx+ 1:5d}] loss: {running_loss / 2000:.3f}')
-                running_loss = 0.0
-
-        lr_scheduler.step()
-
+        # Evaluate the model on the test set after each epoch
         test_acc = evaluate(net, test_loader, device)
-        train_acc = n_correct / n_samples * 100
-        print(
-            f"Epoch {epoch} took {datetime.now()- epoch_start_time}. Train Acc {train_acc:0.2f}, "
-            f"Test Acc {test_acc:0.2f}")
+        # print(f"Test Accuracy after Epoch {epoch + 1}: {test_acc:.2f}%")
 
-        # Save the model
+        # Check if this is the best model so far
         if test_acc > best_test_acc:
             best_test_acc = test_acc
-            best_model = net.state_dict()
+            best_model_state = net.state_dict()
+            # print(f"New Best Model found at Epoch {epoch + 1} with Test Accuracy: {best_test_acc:.2f}%")
 
-    end_time = datetime.now()
-    total_training_time = end_time - train_start_time
-    print(f"Total Training Time {total_training_time}")
+    # Save the best model to the specified directory
+    if save_dir is not None and best_model_state is not None:
+        net.load_state_dict(best_model_state)  # Load best model state
+        save_model(model=net, save_dir=save_dir, n_epochs=n_epochs, best_test_acc=best_test_acc)
+        print(f"Best Model Saved with Test Accuracy: {best_test_acc:.2f}%")
 
-    if best_model:
-        save_model(
-            model=net,
-            best_model_state_dict=best_model,
-            save_dir=save_dir,
-            n_epochs=n_epochs,
-            best_test_acc=best_test_acc
-        )
+    # Calculate and print the total training duration
+    training_duration = datetime.now() - training_start_time
+    print(f"Total Training Duration: {training_duration}")
+
+    print("Training Completed!")
 
     import pdb
     pdb.set_trace()
