@@ -153,9 +153,8 @@ def train(
         # Backward propagation
         loss.backward()
 
-        # Update optimizer and LR scheduler
+        # Update optimizer
         optimizer.step()
-        scheduler.step()
 
         # Train accuracy
         predictions = torch.argmax(outputs, dim=1)
@@ -167,7 +166,10 @@ def train(
             for callback in callbacks:
                 callback()
 
-        train_acc = n_correct / n_samples * 100
+    train_acc = n_correct / n_samples * 100
+
+    # update the learning rate after each epoch
+    scheduler.step()
 
     return train_acc
 
