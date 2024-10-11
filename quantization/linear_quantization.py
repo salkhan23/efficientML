@@ -271,6 +271,23 @@ def plot_weight_distribution(model, bit_width=32, extra_title=''):
     plt.show()
 
 
+@torch.no_grad()
+def quantize_weights_and_plot_histogram(model, bit_width):
+    """
+
+    :param model:
+    :param bit_width:
+    :return:
+    """
+
+    for name, param in model.named_parameters():
+        if param.dim() > 1:
+            quantized_param, scale, zero_point = linear_quantize_symmetric_per_channel(param, bit_width)
+            param.copy_(quantized_param)
+
+    plot_weight_distribution(model, bit_width, "Quantized")
+
+
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
@@ -297,15 +314,9 @@ if __name__ == "__main__":
     bit_widths = [2, 4, 8]
 
     for b_width in bit_widths:
-        for name, param in net.named_parameters():
-            if param.dim() > 1:
-                quantized_param, scale, zero_point = linear_quantize_symmetric_per_channel(param, b_width)
-
-        plot_weight_distribution(net, b_width, extra_title='Quantize')
-
+        quantize_weights_and_plot_histogram(net, b_width)
         # Restore the model
         net.load_state_dict(torch.load(saved_model_file, weights_only=True))
-
 
 
     import pdb
