@@ -9,7 +9,7 @@ sys.path.append(parent_dir)
 
 from vgg import VGG  # noqa: E402  (ignore module import not at top)
 import train_cifar10  # noqa: E402  (ignore module import not at top)
-import model_analysis_utils # noqa: E402  (ignore module import not at top)
+import model_analysis_utils  # noqa: E402  (ignore module import not at top)
 
 
 def k_means_cluster(fp32_tensor: torch.Tensor, k, max_iter=100, tol=1e-4, verbose=False):

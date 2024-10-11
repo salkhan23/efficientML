@@ -3,7 +3,18 @@
 # -------------------------------------------------------------------------------------------------
 import torch
 import matplotlib.pyplot as plt
+import numpy as np
+import os
+import sys
 from matplotlib.colors import ListedColormap
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+
+from vgg import VGG  # noqa: E402  (ignore module import not at top)
+import train_cifar10  # noqa: E402  (ignore module import not at top)
+import model_analysis_utils  # noqa: E402  (ignore module import not at top)
 
 
 def get_quantized_range(bit_width):
@@ -139,12 +150,163 @@ def test_linear_quantize(
     plt.show()
 
 
+def get_quantization_scale_and_zero_point(fp_tensor, bit_width):
+    """
+    S = (r_max - r_min) / (q_max - q_min)
+    r_min = S(q_min - Z)  ==> Z = q_min - int(round(r_min/S))
+
+    get quantization scale for single tensor
+
+    :param fp_tensor: [torch.(cuda.)Tensor] floating tensor to be quantized
+    :param bit_width: [int] quantization bit width
+    :return:
+        [float] scale
+        [int] zero_point
+    """
+    quantized_min, quantized_max = get_quantized_range(bit_width)
+    r_max = fp_tensor.max().item()
+    r_min = fp_tensor.min().item()
+
+    scale = (r_max - r_min)/(quantized_max - quantized_min)
+    zero_point = quantized_min - round(r_min / scale)
+
+    # clip the zero_point to fall in [quantized_min, quantized_max]
+    zero_point = max(quantized_min, min(quantized_max, zero_point))
+
+    return torch.tensor(scale), torch.tensor(zero_point, dtype=torch.int8)
+
+
+def get_symmetric_linear_quantization_scale(fp_tensor, bit_width):
+    """
+
+    :param fp_tensor:
+    :param bit_width:
+    :return:
+    """
+    _, q_max = get_quantized_range(bit_width)
+
+    r_max = max(fp_tensor.abs().max().item(), 5e-7)
+    scale = r_max / q_max
+
+    return torch.tensor(scale)
+
+
+def linear_quantize_symmetric_per_channel(fp_tensor, bit_width):
+    """
+    Return symmetric quantization scales per channel
+
+    :param fp_tensor:  4D Tensor [ch_out, ch_in, r, c]
+    :param bit_width:
+    :return:
+    """
+    n_ch_out = fp_tensor.shape[0]
+
+    scales_per_channel = torch.zeros(n_ch_out, device=fp_tensor.device)
+
+    for ch_out_idx in range(n_ch_out):
+        ch_out_tensor = fp_tensor[ch_out_idx, ]
+        scales_per_channel[ch_out_idx] = get_symmetric_linear_quantization_scale(ch_out_tensor, bit_width)
+
+    # modify scale so it is easily broadcast.
+    # Same shape as fp_tensor, but with all but the output_channel dim=1.
+    # Pytorch will automatically duplicate scale to the same shape as fp_tensor.
+    scale_shape = [1] * fp_tensor.dim()
+    scale_shape[0] = -1
+    scales_per_channel = scales_per_channel.view(scale_shape)
+
+    # now quantize fp_tensor
+    quantized_tensor = linear_quantize(fp_tensor, bit_width, scales_per_channel, 0)
+
+    return quantized_tensor, scales_per_channel, 0
+
+
+def linear_quantize_affine(fp_tensor, bit_width):
+    """
+    linear quantization for feature tensor
+    :param fp_tensor: [torch.(cuda.)Tensor] floating feature to be quantized
+    :param bit_width: [int] quantization bit width
+    :return:
+        [torch.(cuda.)Tensor] quantized tensor
+        [float] scale tensor
+        [int] zero point
+    """
+    scale, zero_point = get_quantization_scale_and_zero_point(fp_tensor, bit_width)
+    quantized_tensor = linear_quantize(fp_tensor, bit_width, scale, zero_point)
+
+    return quantized_tensor, scale, zero_point
+
+
+def plot_weight_distribution(model, bit_width=32, extra_title=''):
+    # bins = (1 << bit_width) if bit_width <= 8 else 256
+    if bit_width <= 8:
+        q_min, q_max = get_quantized_range(bit_width)
+        bins = np.arange(q_min, q_max + 2)
+        align = 'left'
+    else:
+        bins = 256
+        align = 'mid'
+
+    fig, axes = plt.subplots(3, 3, figsize=(10, 6))
+    axes = axes.ravel()
+
+    plot_index = 0
+    for name, param in model.named_parameters():
+        if param.dim() > 1:
+            ax = axes[plot_index]
+            ax.hist(
+                param.detach().view(-1).cpu(), bins=bins, density=True, align=align, color='blue', alpha=0.5,
+                edgecolor='black' if bit_width <= 4 else None)
+
+            if bit_width <= 4:
+                quantized_min, quantized_max = get_quantized_range(bit_width)
+                ax.set_xticks(np.arange(start=quantized_min, stop=quantized_max+1))
+
+            ax.set_xlabel(name)
+            ax.set_ylabel('density')
+            plot_index += 1
+
+    fig.suptitle(f'Histogram of Weights (bit_width={bit_width} bits) {extra_title}')
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.925)
+    plt.show()
+
+
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
     torch.random.manual_seed(random_seed)
 
-    test_linear_quantize()
+    # ---------------------------------------------------------------------------------------------
+    #
+    # ---------------------------------------------------------------------------------------------
+    # test_linear_quantize()
+
+    # ---------------------------------------------------------------------------------------------
+    # Quantize Weight matrices
+    # ---------------------------------------------------------------------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    saved_model_file = "../results_trained_models/07-06-2024_VGG_net_train_epochs_100_acc_81.pth"
+
+    net = VGG()
+    net.load_state_dict(torch.load(saved_model_file, weights_only=True))
+    net.to(device)
+
+    plot_weight_distribution(net, extra_title="Pre-quantization weight distribution")
+
+    bit_widths = [2, 4, 8]
+
+    for b_width in bit_widths:
+        for name, param in net.named_parameters():
+            if param.dim() > 1:
+                quantized_param, scale, zero_point = linear_quantize_symmetric_per_channel(param, b_width)
+
+        plot_weight_distribution(net, b_width, extra_title='Quantize')
+
+        # Restore the model
+        net.load_state_dict(torch.load(saved_model_file, weights_only=True))
+
+
 
     import pdb
     pdb.set_trace()
