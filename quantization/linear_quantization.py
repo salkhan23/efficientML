@@ -191,9 +191,34 @@ def get_symmetric_linear_quantization_scale(fp_tensor, bit_width):
     return torch.tensor(scale)
 
 
-def linear_quantize_symmetric_per_channel(fp_tensor, bit_width):
+def linear_quantize_affine(fp_tensor, bit_width):
     """
-    Return symmetric quantization scales per channel
+    linear quantization fp_tensor using a single scale and zero-point.
+
+    Function computes the scale and zero point and then calls linear_quantize to
+    quantize fp_tensor with the specified bit_width
+
+    :param fp_tensor: [torch.(cuda.)Tensor] floating feature to be quantized
+    :param bit_width: [int] quantization bit width
+    :return:
+        [torch.(cuda.)Tensor] quantized tensor
+        [float] scale tensor
+        [int] zero point
+    """
+    scale, zero_point = get_quantization_scale_and_zero_point(fp_tensor, bit_width)
+    quantized_tensor = linear_quantize(fp_tensor, bit_width, scale, zero_point)
+
+    return quantized_tensor, scale, zero_point
+
+
+def linear_quantize_symmetric_weight_per_channel(fp_tensor, bit_width):
+    """
+    Quantizes (per output channel) the given 4D fp_tensor using symmetric quantization.
+
+    This function computes a symmetric quantization scale for each output channel,
+    and then quantizes the entire tensor using those scales. The scale is reshaped
+    to broadcast correctly over the tensor dimensions for efficient quantization.
+
 
     :param fp_tensor:  4D Tensor [ch_out, ch_in, r, c]
     :param bit_width:
@@ -220,20 +245,50 @@ def linear_quantize_symmetric_per_channel(fp_tensor, bit_width):
     return quantized_tensor, scales_per_channel, 0
 
 
-def linear_quantize_affine(fp_tensor, bit_width):
+def linear_quantize_symmetric_bias_per_output_channel(bias, w_scale, x_scale):
     """
-    linear quantization for feature tensor
-    :param fp_tensor: [torch.(cuda.)Tensor] floating feature to be quantized
-    :param bit_width: [int] quantization bit width
-    :return:
-        [torch.(cuda.)Tensor] quantized tensor
-        [float] scale tensor
-        [int] zero point
-    """
-    scale, zero_point = get_quantization_scale_and_zero_point(fp_tensor, bit_width)
-    quantized_tensor = linear_quantize(fp_tensor, bit_width, scale, zero_point)
+    Perform per-channel symmetric quantization of the bias using weight and input activation scales.
 
-    return quantized_tensor, scale, zero_point
+    This function quantizes the bias tensor per output channel, using the product of weight scale (w_scale)
+    and input activation scale (x_scale) as the bias scale. The zero point is fixed at 0, and a 32-bit
+    quantization is applied to reduce quantization noise, given the sensitivity of bias to small errors.
+
+    Assumptions:
+    1. `bias_scale = w_scale * x_scale`
+    2. Symmetric quantization with zero point = 0 for simpler computation of quantized outputs in layers like
+       fully connected or convolutional.
+
+    :param bias: 1D Tensor of bias values, matching the number of output channels.
+    :param w_scale: Tensor or float representing the quantization scale for the weights.
+    :param x_scale: Float representing the input activation scale.
+
+    :return: Tuple (quantized_bias, bias_scale, zero_point), where quantized_bias is the quantized bias,
+             bias_scale is the computed scale, and zero_point is always 0.
+    """
+    assert bias.dim() == 1, f"Expected bias to be 1D, but got {bias.dim()}D"
+    assert bias.dtype == torch.float, f"Expected bias to be of type torch.float, but got {bias.dtype}"
+
+    # All inputs use the same scale factor
+    assert isinstance(x_scale, float), f"Expected input_scale to be a float, but got {type(x_scale)}"
+
+    if isinstance(w_scale, torch.Tensor):
+        assert w_scale.dtype == torch.float, f"Expected weight_scale to be of type torch.float, but got {w_scale.dtype}"
+
+        # reshape the weight scale tensor (w_scale) into a 1D tensor (a vector) to ensure that it has
+        # a shape of [n_output_channels], where n_output_channels is the number of output channels
+        # or elements in the bias.
+        w_scale = w_scale.view(-1)
+
+        assert bias.numel() == w_scale.numel(), (
+            f"Number of elements in bias ({bias.numel()}) does not match "
+            f"number of elements in weight_scale ({w_scale.numel()})"
+        )
+
+    bias_scale = w_scale * x_scale
+
+    quantized_bias = linear_quantize(bias, 32, bias_scale, zero_point=0, dtype=torch.int32)
+
+    return quantized_bias, bias_scale, 0
 
 
 def plot_weight_distribution(model, bit_width=32, extra_title=''):
@@ -282,7 +337,7 @@ def quantize_weights_and_plot_histogram(model, bit_width):
 
     for name, param in model.named_parameters():
         if param.dim() > 1:
-            quantized_param, scale, zero_point = linear_quantize_symmetric_per_channel(param, bit_width)
+            quantized_param, scale, zero_point = linear_quantize_symmetric_weight_per_channel(param, bit_width)
             param.copy_(quantized_param)
 
     plot_weight_distribution(model, bit_width, "Quantized")
@@ -317,7 +372,6 @@ if __name__ == "__main__":
         quantize_weights_and_plot_histogram(net, b_width)
         # Restore the model
         net.load_state_dict(torch.load(saved_model_file, weights_only=True))
-
 
     import pdb
     pdb.set_trace()
