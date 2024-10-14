@@ -558,24 +558,24 @@ def quantized_conv2d(
     :return:
         [torch.(cuda.)CharTensor] quantized output feature
     """
-    assert (len(padding) == 4)
-    assert (input_x.dtype == torch.int8)
-    assert (weight.dtype == input_x.dtype)
-    assert (bias is None or bias.dtype == torch.int32)
-    assert (isinstance(input_zero_point, int))
-    assert (isinstance(output_zero_point, int))
-    assert (isinstance(input_scale, float))
-    assert (isinstance(output_scale, float))
-    assert (weight_scale.dtype == torch.float)
+    assert len(padding) == 4, "Padding must be a length 4 tuple."
+    assert input_x.dtype == torch.int8, "Input tensor must be of type torch.int8."
+    assert weight.dtype == torch.int8, "Weight tensor must be of type torch.int8."
+    assert bias is None or bias.dtype == torch.int32, "Bias must be of type torch.int32 or None."
+    assert isinstance(input_zero_point, int), "Input zero point must be an integer."
+    assert isinstance(output_zero_point, int), "Output zero point must be an integer."
+    assert isinstance(input_scale, float), "Input scale must be a float."
+    assert isinstance(output_scale, float), "Output scale must be a float."
+    assert weight_scale.dtype == torch.float, "Weight scale must be of type torch.float."
 
-    # Step 1: calculate integer-based 2d convolution (8-bit multiplication with 32-bit accumulation)
-
+    # Step 1: Pad input tensor with input_zero_point
     # In quantized neural networks, the input tensor is quantized using a zero point to represent integer values.
     # Padding with the same zero point ensures that the padded areas align well with the quantization scheme,
     # making the convolution operation more consistent across the entire input tensor.
     # It is also handled here separately for greater control
     input_x = torch.nn.functional.pad(input_x, padding, 'constant', value=input_zero_point)
 
+    # Step 2: calculate integer-based 2d convolution (8-bit multiplication with 32-bit accumulation)
     if 'cpu' in input_x.device.type:
         # use 32-b MAC for simplicity
         output = torch.nn.functional.conv2d(
@@ -587,19 +587,18 @@ def quantized_conv2d(
 
         output = output.round().to(torch.int32)
 
-    # bias is handled separately for greater control
+    # Step 3: Add bias if present
     if bias is not None:
         output = output + bias.view(1, -1, 1, 1)
 
-    # Step 2: scale the output
+    # Step 4: Scale the output
     weight_scale = weight_scale.view(1, -1)
     output = output * input_scale * weight_scale / output_scale
 
-    # Step 3: shift output by output_zero_point
-    #         hint: one line of code
+    # Step 5: Shift output by output_zero_point
     output = output + input_zero_point
 
-    # Make sure all value lies in the bit_width-bit range
+    # Step 6: Clamp values to the quantized range and convert to int8
     q_min, q_max = get_quantize_range(feature_bit_width)
     output = output.round().clamp(q_min, q_max).to(torch.int8)
     return output
