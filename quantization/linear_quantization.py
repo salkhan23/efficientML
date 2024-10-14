@@ -426,7 +426,7 @@ def test_quantized_fc(
             [ 0,  0,  0,  0,  0,  1, -1, -2]], dtype=torch.int8),
         bit_width=2, batch_size=4, in_channels=8, out_channels=8):
 
-    def plot_matrix(tensor, ax, title, vmin=0., vmax=1., cmap=None):
+    def plot_matrix(tensor, ax, title, vmin=0., vmax=1., cmap='bwr'):
         ax.imshow(tensor.cpu().numpy(), vmin=vmin, vmax=vmax, cmap=cmap)
         ax.set_title(title)
         ax.set_yticklabels([])
@@ -451,12 +451,12 @@ def test_quantized_fc(
     # Quantize the bias
     _quantized_bias, bias_scale, bias_zero_point = \
         linear_quantize_symmetric_bias_per_output_channel(bias, weight_scale, input_scale)
-    assert _quantized_bias.equal(_quantized_bias)
+    assert _quantized_bias.equal(_quantized_bias)  # check for NaNs
 
     # Calculated output - precompute Q_bias
     _shifted_quantized_bias = \
         shift_quantized_linear_bias(quantized_bias, quantized_weight, input_zero_point)
-    assert _shifted_quantized_bias.equal(shifted_quantized_bias)
+    assert _shifted_quantized_bias.equal(shifted_quantized_bias)  # check that values match with input
 
     # Quantize the output
     quantized_output, output_scale, output_zero_point = linear_quantize_affine(output, bit_width)
@@ -467,7 +467,7 @@ def test_quantized_fc(
         bit_width, bit_width,
         input_zero_point, output_zero_point,
         input_scale, weight_scale, output_scale)
-    assert _calc_quantized_output.equal(calc_quantized_output)
+    assert _calc_quantized_output.equal(calc_quantized_output)  # check that values match with input
 
     reconstructed_weight = weight_scale * (quantized_weight.float() - weight_zero_point)
     reconstructed_input = input_scale * (quantized_input.float() - input_zero_point)
@@ -482,18 +482,18 @@ def test_quantized_fc(
     plot_matrix(output.t(), axes[2, 0], 'original output', vmin=-1.5, vmax=1.5)
 
     plot_matrix(quantized_weight, axes[0, 1], f'{bit_width}-bit linear quantized weight',
-                vmin=quantized_min, vmax=quantized_max, cmap='tab20c')
+                vmin=quantized_min, vmax=quantized_max, cmap='bwr')
     plot_matrix(quantized_input.t(), axes[1, 1], f'{bit_width}-bit linear quantized input',
-                vmin=quantized_min, vmax=quantized_max, cmap='tab20c')
+                vmin=quantized_min, vmax=quantized_max, cmap='bwr')
     plot_matrix(calc_quantized_output.t(), axes[2, 1], f'quantized output from quantized_linear()',
-                vmin=quantized_min, vmax=quantized_max, cmap='tab20c')
+                vmin=quantized_min, vmax=quantized_max, cmap='bwr')
 
     plot_matrix(reconstructed_weight, axes[0, 2], f'reconstructed weight',
-                vmin=-0.5, vmax=0.5, cmap='tab20c')
+                vmin=-0.5, vmax=0.5, cmap='bwr')
     plot_matrix(reconstructed_input.t(), axes[1, 2], f'reconstructed input',
-                vmin=0, vmax=1, cmap='tab20c')
+                vmin=0, vmax=1, cmap='bwr')
     plot_matrix(reconstructed_calc_output.t(), axes[2, 2], f'reconstructed output',
-                vmin=-1.5, vmax=1.5, cmap='tab20c')
+                vmin=-1.5, vmax=1.5, cmap='bwr')
 
     print('* Test quantized_fc()')
     print(f'    target bit_width: {bit_width} bits')
@@ -503,6 +503,106 @@ def test_quantized_fc(
     print('* Test passed.')
     fig.tight_layout()
     plt.show()
+
+
+def shift_quantized_conv2d_bias(quantized_bias, quantized_weight, input_zero_point):
+    """
+    Computes the shifted bias (Q_bias) for quantized convolutional layers (Q_bias).
+
+    shifted_bias = q_b - Conv(Z_x, q_w)
+
+     where:
+    - q_b: quantized bias
+    - Z_x: input zero-point
+    - q_w: quantized weight [ch-out, ch_in, r, c]
+
+    Note: This function does not perform an actual convolution. Instead, it sums the weights across
+    the input channels and spatial dimensions, then multiplies by the input zero point which is a single
+    number of each channel
+
+    :param quantized_bias: [torch.IntTensor] quantized bias (torch.int32)
+    :param quantized_weight: [torch.CharTensor] quantized weight (torch.int8)
+    :param input_zero_point: [int] input zero point
+
+    :return:
+        [torch.IntTensor] shifted quantized bias tensor
+    """
+    assert quantized_bias.dtype == torch.int32, "Expected quantized bias to be of type int32."
+    assert isinstance(input_zero_point, int), "Input zero point must be an integer."
+
+    return quantized_bias - quantized_weight.sum((1, 2, 3)).to(torch.int32) * input_zero_point
+
+
+def quantized_conv2d(
+        input_x, weight, bias, feature_bit_width, weight_bit_width, input_zero_point, output_zero_point,
+        input_scale, weight_scale, output_scale, stride, padding, dilation, groups):
+    """
+    quantized 2d convolution
+
+    q_y= (CONV[q_x,q_w] + Qbias)⋅(S_x* S_w/ S_y) + Z_y
+
+    :param groups:
+    :param dilation:
+    :param padding:
+    :param stride:
+    :param input_x: [torch.CharTensor] quantized input (torch.int8)
+    :param weight: [torch.CharTensor] quantized weight (torch.int8)
+    :param bias: [torch.IntTensor] shifted quantized bias or None (torch.int32)
+    :param feature_bit_width: [int] quantization bit width of input and output
+    :param weight_bit_width: [int] quantization bit width of weight
+    :param input_zero_point: [int] input zero point
+    :param output_zero_point: [int] output zero point
+    :param input_scale: [float] input feature scale
+    :param weight_scale: [torch.FloatTensor] weight per-channel scale
+    :param output_scale: [float] output feature scale
+    :return:
+        [torch.(cuda.)CharTensor] quantized output feature
+    """
+    assert (len(padding) == 4)
+    assert (input_x.dtype == torch.int8)
+    assert (weight.dtype == input_x.dtype)
+    assert (bias is None or bias.dtype == torch.int32)
+    assert (isinstance(input_zero_point, int))
+    assert (isinstance(output_zero_point, int))
+    assert (isinstance(input_scale, float))
+    assert (isinstance(output_scale, float))
+    assert (weight_scale.dtype == torch.float)
+
+    # Step 1: calculate integer-based 2d convolution (8-bit multiplication with 32-bit accumulation)
+
+    # In quantized neural networks, the input tensor is quantized using a zero point to represent integer values.
+    # Padding with the same zero point ensures that the padded areas align well with the quantization scheme,
+    # making the convolution operation more consistent across the entire input tensor.
+    # It is also handled here separately for greater control
+    input_x = torch.nn.functional.pad(input_x, padding, 'constant', value=input_zero_point)
+
+    if 'cpu' in input_x.device.type:
+        # use 32-b MAC for simplicity
+        output = torch.nn.functional.conv2d(
+            input_x.to(torch.int32), weight.to(torch.int32), None, stride, 0, dilation, groups)
+    else:
+        # current version pytorch does not yet support integer-based conv2d() on GPUs
+        output = torch.nn.functional.conv2d(
+            input_x.float(), weight.float(), None, stride, 0, dilation, groups)
+
+        output = output.round().to(torch.int32)
+
+    # bias is handled separately for greater control
+    if bias is not None:
+        output = output + bias.view(1, -1, 1, 1)
+
+    # Step 2: scale the output
+    weight_scale = weight_scale.view(1, -1)
+    output = output * input_scale * weight_scale / output_scale
+
+    # Step 3: shift output by output_zero_point
+    #         hint: one line of code
+    output = output + input_zero_point
+
+    # Make sure all value lies in the bit_width-bit range
+    q_min, q_max = get_quantize_range(feature_bit_width)
+    output = output.round().clamp(q_min, q_max).to(torch.int8)
+    return output
 
 
 @torch.no_grad()
