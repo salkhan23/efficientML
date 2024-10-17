@@ -3,7 +3,7 @@
 # Affine Transformation for activations and Symmetric Quantization for weights and biases
 # -------------------------------------------------------------------------------------------------
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+import copy
 import torch
 import numpy as np
 import os
@@ -507,7 +507,7 @@ def test_quantized_fc(
 
 def shift_quantized_conv2d_bias(quantized_bias, quantized_weight, input_zero_point):
     """
-    Computes the shifted bias (Q_bias) for quantized convolutional layers (Q_bias).
+    Computes the shifted bias (Q_bias) for quantized convolutional layers.
 
     shifted_bias = q_b - Conv(Z_x, q_w)
 
@@ -517,8 +517,8 @@ def shift_quantized_conv2d_bias(quantized_bias, quantized_weight, input_zero_poi
     - q_w: quantized weight [ch-out, ch_in, r, c]
 
     Note: This function does not perform an actual convolution. Instead, it sums the weights across
-    the input channels and spatial dimensions, then multiplies by the input zero point which is a single
-    number of each channel
+    the input channels and spatial dimensions, then multiplies by the input zero point of the channel
+    which is a single number.
 
     :param quantized_bias: [torch.IntTensor] quantized bias (torch.int32)
     :param quantized_weight: [torch.CharTensor] quantized weight (torch.int8)
@@ -572,12 +572,16 @@ def quantized_conv2d(
     # In quantized neural networks, the input tensor is quantized using a zero point to represent integer values.
     # Padding with the same zero point ensures that the padded areas align well with the quantization scheme,
     # making the convolution operation more consistent across the entire input tensor.
-    # It is also handled here separately for greater control
+    # It is handled here separately for greater control
     input_x = torch.nn.functional.pad(input_x, padding, 'constant', value=input_zero_point)
 
     # Step 2: calculate integer-based 2d convolution (8-bit multiplication with 32-bit accumulation)
     if 'cpu' in input_x.device.type:
         # use 32-b MAC for simplicity
+        # What should be done is 8 bit convolution, stored in 32-bit number
+        # Torch doesn't natively support 8-bit integer (int8) convolution on the CPU. There are specialized
+        # quantized modules for int8 operations (like torch.quantized.conv2d), but using regular conv2d
+        # with int8 can lead to unsupported operations or inconsistent results.
         output = torch.nn.functional.conv2d(
             input_x.to(torch.int32), weight.to(torch.int32), None, stride, 0, dilation, groups)
     else:
@@ -659,6 +663,61 @@ def plot_weight_distributions(model, bit_width=32, extra_title=''):
     fig.subplots_adjust(top=0.925)
 
 
+def fuse_conv_bn(conv, bn):
+    """
+    Fuses a BatchNorm2d layer into the preceding Conv2d layer.
+
+    This operation merges the normalization BN layer into the weights and biases of preceding Conv2D layer,
+    removing the need for a separate BatchNorm during inference.
+
+    BatchNorm introduces floating-point operations that are inefficient on quantized hardware. By
+    combining the layers, the entire convolution operation can be quantized, improving performance and
+    reduces model size.
+
+    **How It Works**:
+    The fusion modifies the convolution layer’s weights and biases to include the effects of the BatchNorm
+    layer's learned parameters:
+
+    - **BatchNorm Parameters**:
+        - `mu`: running mean (computed during training).
+        - `sigma^2`: running variance (computed during training).
+        - `gamma`: learnable scale parameter (`bn.weight`).
+        - `beta`: learnable shift parameter (`bn.bias`).
+
+    The fused weights and bias are computed as:
+        - `w' = w * gamma / sqrt(sigma^2 + eps)`
+        - `b' = (b - mu) * gamma / sqrt(sigma^2 + eps) + beta`
+
+    **Benefits**:
+    - Simplifies inference by merging layers.
+    - Removes floating-point operations introduced by BatchNorm, making the model more efficient for
+      quantization.
+    - Reduces the number of layers and operations, leading to faster execution on hardware optimized
+      for low-precision computations (e.g., CPUs or accelerators).
+
+    **Reference**:
+    Modified from: https://mmcv.readthedocs.io/en/latest/_modules/mmcv/cnn/utils/fuse_conv_bn.html
+
+    :param conv: torch.nn.Conv2d: The convolutional layer to fuse.
+    :param bn: torch.nn.BatchNorm2d: The BatchNorm layer to fuse.
+
+    :return: torch.nn.Conv2d: The fused Conv2d layer, with updated weights and biases.
+    """
+    assert conv.bias is None, "Conv2d layer must not have a bias before fusion."
+
+    # Compute the scaling factor (gamma / sqrt(running_var + eps))
+    scale_factor = bn.weight.data / torch.sqrt(bn.running_var.data + bn.eps)
+
+    # Update the convolution weights: w' = w * scale_factor
+    conv.weight.data = conv.weight.data * scale_factor.reshape(-1, 1, 1, 1)  # Per output channel
+
+    # Update the convolution bias: b' = (b - mu) * scale_factor + beta
+    # If no bias is present in conv, initialize it
+    conv.bias = torch.nn.Parameter(- bn.running_mean.data * scale_factor + bn.bias.data)
+
+    return conv
+
+
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
@@ -674,19 +733,19 @@ if __name__ == "__main__":
     # # ---------------------------------------------------------------------------------------------
     # # Quantize Model Weights
     # # ---------------------------------------------------------------------------------------------
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # saved_model_file = "../results_trained_models/07-06-2024_VGG_net_train_epochs_100_acc_81.pth"
-    #
-    # net = VGG()
-    #
-    # net.load_state_dict(torch.load(saved_model_file, weights_only=True))
-    # net.to(device)
-    #
-    # b_size = 128
-    # data_dir = './data'
-    #
-    # train_data_set, train_loader, test_data_set, test_loader, _ = (
-    #     train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    saved_model_file = "../results_trained_models/07-06-2024_VGG_net_train_epochs_100_acc_81.pth"
+
+    net = VGG()
+
+    net.load_state_dict(torch.load(saved_model_file, weights_only=True))
+    net.to(device)
+
+    b_size = 128
+    data_dir = './data'
+
+    train_data_set, train_loader, test_data_set, test_loader, _ = (
+        train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
     #
     # # Distribution of weights of the floating point model
     # plot_weight_distributions(net, extra_title='Floating point model')
@@ -706,8 +765,36 @@ if __name__ == "__main__":
     #     net.load_state_dict(torch.load(saved_model_file, weights_only=True))
 
     # ---------------------------------------------------------------------------------------------
-    # Quantize Model Weights
+    # Fuse BM and convolutional layers to simplify quantization
     # ---------------------------------------------------------------------------------------------
+    print('Before conv-bn fusion: backbone length', len(net.backbone))
+
+    #  fuse the BN into conv layers - for less compute  quantization
+    net.load_state_dict(torch.load(saved_model_file, weights_only=True))
+
+    model_fused = copy.deepcopy(net)
+
+    fused_backbone = []
+    ptr = 0
+    while ptr < len(model_fused.backbone):
+        if isinstance(model_fused.backbone[ptr], torch.nn.Conv2d) and \
+                isinstance(model_fused.backbone[ptr + 1], torch.nn.BatchNorm2d):
+            fused_backbone.append(fuse_conv_bn(model_fused.backbone[ptr], model_fused.backbone[ptr + 1]))
+            ptr += 2
+        else:
+            fused_backbone.append(model_fused.backbone[ptr])
+            ptr += 1
+    model_fused.backbone = torch.nn.Sequential(*fused_backbone)
+
+    print('After conv-bn fusion: backbone length', len(model_fused.backbone))
+
+    # sanity check, no BN anymore
+    for m in model_fused.modules():
+        assert not isinstance(m, torch.nn.BatchNorm2d)
+
+    #  the accuracy will remain the same after fusion
+    fused_acc = train_cifar10.evaluate(model_fused, test_loader, device)
+    print(f'Accuracy of the fused model={fused_acc:.2f}%')
 
     import pdb
     pdb.set_trace()
