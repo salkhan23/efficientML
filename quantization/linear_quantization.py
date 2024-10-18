@@ -8,6 +8,7 @@ import torch
 import numpy as np
 import os
 import sys
+from collections import namedtuple
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -718,21 +719,97 @@ def fuse_conv_bn(conv, bn):
     return conv
 
 
+Range = namedtuple('Range', ['r_min', 'r_max'])
+
+
+def add_range_recoder_hooks(model, x_range_store_dict, y_range_store_dict):
+    """
+    Add hooks to monitor activation min, max values for model inputs and outputs.
+
+    :param model: The model to attach hooks to.
+    :param x_range_store_dict: Dictionary to store min and max values of inputs.
+    :param y_range_store_dict: Dictionary to store min and max values of outputs.
+    :return: List of all hooks.
+    """
+
+    def _record_range(mod, x, y, mod_name):
+        """
+        Record min and max values of inputs and outputs for a given module.
+
+        :param mod: The module for which the hook is called.
+        :param x: Input to the module (tuple).
+        :param y: Output from the module.
+        :param mod_name: Name of the module.
+        """
+        x = x[0]  # Inputs are tuples; take the first element
+
+        # Calculate min and max for input activations
+        x_min = x.min().item()
+        x_max = x.max().item()
+
+        # Calculate min and max for output activations
+        y_min = y.min().item()
+        y_max = y.max().item()
+
+        # Update input ranges
+        if mod_name not in x_range_store_dict:
+            x_range_store_dict[mod_name] = Range(x_min, x_max)
+        else:
+            x_range_store_dict[mod_name] = Range(
+                min(x_min, x_range_store_dict[mod_name].r_min),
+                max(x_max, x_range_store_dict[mod_name].r_max)
+            )
+
+        # Update output ranges
+        if mod_name not in y_range_store_dict:
+            y_range_store_dict[mod_name] = Range(y_min, y_max)
+        else:
+            y_range_store_dict[mod_name] = Range(
+                min(y_min, y_range_store_dict[mod_name].r_min),
+                max(y_max, y_range_store_dict[mod_name].r_max)
+            )
+
+    all_hooks = []
+
+    for module_name, module in model.named_modules():
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear, torch.nn.ReLU)):
+            # Define a custom hook function that captures the module_name
+            def hook_function(mod, x, y, mod_name=module_name):
+                """
+                Hook function called during the forward pass of the module.
+                This function captures the module's input and output values
+                and passes them to the _record_range function along with
+                the module name.
+
+                When the forward hook is triggered:
+                - `mod` is the module where the hook is attached.
+                - `x` is the input to the module, a tuple.
+                - `y` is the output from the module.
+                - `module_name` is captured from the outer scope and
+                  corresponds to the name of the module, ensuring that
+                  the correct range values are recorded in the dictionaries.
+
+                :param mod: The module for which the hook is called.
+                :param x: Input to the module (tuple).
+                :param y: Output from the module.
+                :param mod_name: Name of the module.
+                """
+                _record_range(mod, x, y, mod_name)
+
+            # Register the forward hook
+            hook_handle = module.register_forward_hook(hook_function)
+
+            all_hooks.append(hook_handle)
+
+    return all_hooks
+
+
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
     torch.random.manual_seed(random_seed)
 
-    # # ---------------------------------------------------------------------------------------------
-    # # Test Quantization Function
-    # # ---------------------------------------------------------------------------------------------
-    # test_linear_quantize()
-
-    test_quantized_fc()
-
-    # # ---------------------------------------------------------------------------------------------
-    # # Quantize Model Weights
-    # # ---------------------------------------------------------------------------------------------
+    # Load Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     saved_model_file = "../results_trained_models/07-06-2024_VGG_net_train_epochs_100_acc_81.pth"
 
@@ -746,11 +823,25 @@ if __name__ == "__main__":
 
     train_data_set, train_loader, test_data_set, test_loader, _ = (
         train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
-    #
+
+    # print(f"Floating point Model Accuracy {train_cifar10.evaluate(net, test_loader, device):0.2f}")
+
+    # # ---------------------------------------------------------------------------------------------
+    # # Test Quantization Function
+    # # ---------------------------------------------------------------------------------------------
+    # print("Test linear quantization function ...")
+    # test_linear_quantize()
+
+    # print("Test linear quantize Full connected layer ...")
+    # test_quantized_fc()
+
+    # ---------------------------------------------------------------------------------------------
+    # Quantize Model Weights
+    # ---------------------------------------------------------------------------------------------
     # # Distribution of weights of the floating point model
     # plot_weight_distributions(net, extra_title='Floating point model')
     #
-    # # Quantize Model and plot weight distributions
+    # # Quantize model weights and plot weight distributions
     # quantized_bit_widths = [2, 4, 8]
     #
     # for q_bit_width in quantized_bit_widths:
@@ -765,7 +856,8 @@ if __name__ == "__main__":
     #     net.load_state_dict(torch.load(saved_model_file, weights_only=True))
 
     # ---------------------------------------------------------------------------------------------
-    # Fuse BM and convolutional layers to simplify quantization
+    # Fuse Convolutional & BN layer
+    # commonly done f in quantized networks
     # ---------------------------------------------------------------------------------------------
     print('Before conv-bn fusion: backbone length', len(net.backbone))
 
@@ -793,8 +885,37 @@ if __name__ == "__main__":
         assert not isinstance(m, torch.nn.BatchNorm2d)
 
     #  the accuracy will remain the same after fusion
-    fused_acc = train_cifar10.evaluate(model_fused, test_loader, device)
-    print(f'Accuracy of the fused model={fused_acc:.2f}%')
+    # fused_acc = train_cifar10.evaluate(model_fused, test_loader, device)
+    # print(f'Accuracy of the fused model={fused_acc:.2f}%')
+
+    # ---------------------------------------------------------------------------------------------
+    # Find r_min/r_max of for input and outputs quantization
+    # ---------------------------------------------------------------------------------------------
+    # add hook to record the min max value of the activation
+    input_activation_ranges = {}
+    output_activation_ranges = {}
+
+    model_hooks = add_range_recoder_hooks(model_fused, input_activation_ranges, output_activation_ranges)
+
+    # Pass some same data
+    n_samples = 500
+    for s_idx in range(n_samples):
+        sample_input = iter(train_loader).__next__()[0]  # just the input
+        model_fused(sample_input.to(device))
+
+        import pdb
+        pdb.set_trace()
+
+    # remove hooks
+    for h in model_hooks:
+        h.remove()
+
+    # print min max values for each layer:
+    for k, v in input_activation_ranges.items():
+        print(f"Input {k}: min {v.r_min}, max = {v.r_max}")
+
+    # ----------------------------------------------------------------------------------------
+    # ----------------------------------------------------------------------------------------
 
     import pdb
     pdb.set_trace()
