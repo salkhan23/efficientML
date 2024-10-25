@@ -664,24 +664,23 @@ def plot_weight_distributions(model, bit_width=32, extra_title=''):
     fig.subplots_adjust(top=0.925)
 
 
-def fuse_conv_bn(conv, bn):
+def fuse_conv_bn(conv_layer, bn_layer):
     """
     Fuses a BatchNorm2d layer into the preceding Conv2d layer.
 
     This operation merges the normalization BN layer into the weights and biases of preceding Conv2D layer,
     removing the need for a separate BatchNorm during inference.
 
-    BatchNorm introduces floating-point operations that are inefficient on quantized hardware. By
-    combining the layers, the entire convolution operation can be quantized, improving performance and
-    reduces model size.
+    Furthermore, BN introduces floating-point operations. By combining the 2 layers, the entire
+    operation can be quantized at once, improving performance and reducing model size.
 
     **How It Works**:
-    The fusion modifies the convolution layer’s weights and biases to include the effects of the BatchNorm
+    The fusion modifies the convolution layer’s weights and biases to include the effects of the BN
     layer's learned parameters:
 
     - **BatchNorm Parameters**:
-        - `mu`: running mean (computed during training).
-        - `sigma^2`: running variance (computed during training).
+        - `mu`: running mean (computed during training, bn_layer.running_mean).
+        - `sigma^2`: running variance (computed during training, bn_layer.running var).
         - `gamma`: learnable scale parameter (`bn.weight`).
         - `beta`: learnable shift parameter (`bn.bias`).
 
@@ -691,32 +690,31 @@ def fuse_conv_bn(conv, bn):
 
     **Benefits**:
     - Simplifies inference by merging layers.
-    - Removes floating-point operations introduced by BatchNorm, making the model more efficient for
-      quantization.
-    - Reduces the number of layers and operations, leading to faster execution on hardware optimized
+    - Removes floating-point operations introduced by BN, making the model more efficient for quantization.
+    - Reduces the number of layers and operations, leading to faster execution on HW optimized
       for low-precision computations (e.g., CPUs or accelerators).
 
-    **Reference**:
+    ** Reference **:
     Modified from: https://mmcv.readthedocs.io/en/latest/_modules/mmcv/cnn/utils/fuse_conv_bn.html
 
-    :param conv: torch.nn.Conv2d: The convolutional layer to fuse.
-    :param bn: torch.nn.BatchNorm2d: The BatchNorm layer to fuse.
+    :param conv_layer: torch.nn.Conv2d: The convolutional layer to fuse.
+    :param bn_layer: torch.nn.BatchNorm2d: The BatchNorm layer to fuse.
 
     :return: torch.nn.Conv2d: The fused Conv2d layer, with updated weights and biases.
     """
-    assert conv.bias is None, "Conv2d layer must not have a bias before fusion."
+    assert conv_layer.bias is None, "Conv2d layer must not have a bias before fusion."
 
-    # Compute the scaling factor (gamma / sqrt(running_var + eps))
-    scale_factor = bn.weight.data / torch.sqrt(bn.running_var.data + bn.eps)
+    # Compute the scaling factor = gamma / sqrt(running_var + eps)
+    scale_factor = bn_layer.weight.data / torch.sqrt(bn_layer.running_var.data + bn_layer.eps)
 
     # Update the convolution weights: w' = w * scale_factor
-    conv.weight.data = conv.weight.data * scale_factor.reshape(-1, 1, 1, 1)  # Per output channel
+    conv_layer.weight.data = conv_layer.weight.data * scale_factor.reshape(-1, 1, 1, 1)  # Per output channel
 
     # Update the convolution bias: b' = (b - mu) * scale_factor + beta
     # If no bias is present in conv, initialize it
-    conv.bias = torch.nn.Parameter(- bn.running_mean.data * scale_factor + bn.bias.data)
+    conv_layer.bias = torch.nn.Parameter(bn_layer.bias.data - bn_layer.running_mean.data * scale_factor)
 
-    return conv
+    return conv_layer
 
 
 Range = namedtuple('Range', ['r_min', 'r_max'])
@@ -732,11 +730,11 @@ def add_range_recoder_hooks(model, x_range_store_dict, y_range_store_dict):
     :return: List of all hooks.
     """
 
-    def _record_range(mod, x, y, mod_name):
+    def _record_range(_, x, y, mod_name):
         """
         Record min and max values of inputs and outputs for a given module.
 
-        :param mod: The module for which the hook is called.
+        :param _: The module for which the hook is called. (part of feedforward hook callback)
         :param x: Input to the module (tuple).
         :param y: Output from the module.
         :param mod_name: Name of the module.
@@ -857,17 +855,20 @@ if __name__ == "__main__":
 
     # ---------------------------------------------------------------------------------------------
     # Fuse Convolutional & BN layer
-    # commonly done f in quantized networks
+    # Commonly done in quantized networks - BN is just a scaling and a shifting operation
+    # For reducing the compute during interference it can be added as a multiplication and a bias
     # ---------------------------------------------------------------------------------------------
-    print('Before conv-bn fusion: backbone length', len(net.backbone))
+    print("Fusing BN and Convolutional layers for inference efficiency")
 
-    #  fuse the BN into conv layers - for less compute  quantization
+    # Load original model
     net.load_state_dict(torch.load(saved_model_file, weights_only=True))
+    print('Before conv-bn fusion backbone length', len(net.backbone))
 
     model_fused = copy.deepcopy(net)
 
     fused_backbone = []
     ptr = 0
+
     while ptr < len(model_fused.backbone):
         if isinstance(model_fused.backbone[ptr], torch.nn.Conv2d) and \
                 isinstance(model_fused.backbone[ptr + 1], torch.nn.BatchNorm2d):
@@ -876,15 +877,15 @@ if __name__ == "__main__":
         else:
             fused_backbone.append(model_fused.backbone[ptr])
             ptr += 1
-    model_fused.backbone = torch.nn.Sequential(*fused_backbone)
 
+    model_fused.backbone = torch.nn.Sequential(*fused_backbone)
     print('After conv-bn fusion: backbone length', len(model_fused.backbone))
 
     # sanity check, no BN anymore
     for m in model_fused.modules():
         assert not isinstance(m, torch.nn.BatchNorm2d)
 
-    #  the accuracy will remain the same after fusion
+    # Accuracy should remain the same after fusion
     # fused_acc = train_cifar10.evaluate(model_fused, test_loader, device)
     # print(f'Accuracy of the fused model={fused_acc:.2f}%')
 
