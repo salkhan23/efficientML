@@ -389,7 +389,9 @@ def quantized_linear_layer(
 
     # Step 2: scale the output
     # Weight_scale: [oc, 1, 1, 1] -> [oc], then expanded to [1, oc] to match output shape [batch_size, oc]
-    weight_scale = weight_scale.view(1, -1)
+    weight_shape = [1] * output.dim()
+    weight_shape[1] = -1
+    weight_scale = weight_scale.view(weight_shape)
     output = output * input_scale * weight_scale / output_scale
 
     # Step 3: shift output by output_zero_point
@@ -594,10 +596,14 @@ def quantized_conv2d(
 
     # Step 3: Add bias if present
     if bias is not None:
+        # Output tensor from a convolution is shaped as (batch_size, out_channels, height, width)
         output = output + bias.view(1, -1, 1, 1)
 
     # Step 4: Scale the output
-    weight_scale = weight_scale.view(1, -1)
+    weight_shape = [1] * output.dim()
+    weight_shape[1] = -1
+
+    weight_scale = weight_scale.view(weight_shape)
     output = output * input_scale * weight_scale / output_scale
 
     # Step 5: Shift output by output_zero_point
@@ -606,6 +612,7 @@ def quantized_conv2d(
     # Step 6: Clamp values to the quantized range and convert to int8
     q_min, q_max = get_quantize_range(feature_bit_width)
     output = output.round().clamp(q_min, q_max).to(torch.int8)
+
     return output
 
 
@@ -802,6 +809,129 @@ def add_range_recoder_hooks(model, x_range_store_dict, y_range_store_dict):
     return all_hooks
 
 
+class QuantizedConv2d(torch.nn.Module):
+    def __init__(
+            self, weight, bias, in_zp, out_zp, in_scale, w_scale, out_scale, stride, padding, dilation, groups,
+            feature_bit_width=8, weight_bit_width=8):
+        """
+        Create a quantized Conv2d Layer. This stores all the parameters needed for quantized
+        operations and calls the quantized_conv2d function for the actual computation.
+
+        :param weight:
+        :param bias:
+        :param in_zp:
+        :param out_zp:
+        :param in_scale:
+        :param w_scale:
+        :param out_scale:
+        :param stride:
+        :param padding:
+        :param dilation:
+        :param groups:
+        :param feature_bit_width:
+        :param weight_bit_width:
+
+        return a torch layer that does quantized conv2d operations
+        """
+
+        super().__init__()
+
+        #  PyTorch's current version does not support using IntTensor as nn.Parameter.
+        # Since backpropagation is not needed, Store these values as buffers using register_buffer.
+        # Buffers are tensors that do not require gradients and are not involved in backpropagation.
+        self.register_buffer('weight', weight)
+        self.register_buffer('bias', bias)
+
+        self.input_zero_point = in_zp
+        self.output_zero_point = out_zp
+
+        self.input_scale = in_scale
+        self.register_buffer('weight_scale', w_scale)
+        self.output_scale = out_scale
+
+        self.stride = stride
+        self.padding = (padding[1], padding[1], padding[0], padding[0])
+        self.dilation = dilation
+        self.groups = groups
+
+        self.feature_bit_width = feature_bit_width
+        self.weight_bit_width = weight_bit_width
+
+    def forward(self, x):
+        return quantized_conv2d(
+            x, self.weight, self.bias, self.feature_bit_width, self.weight_bit_width, self.input_zero_point,
+            self.output_zero_point, self.input_scale, self.weight_scale, self.output_scale, self.stride,
+            self.padding, self.dilation, self.groups
+        )
+
+
+class QuantizedLinear(torch.nn.Module):
+    def __init__(
+            self, weight, bias, input_zero_point, output_zero_point, input_scale, weight_scale, output_scale,
+            feature_bit_width=8, weight_bit_width=8):
+        """
+        A quantized linear (fully connected) layer. It stores the parameters needed for quantization
+        and calls the `quantized_linear_layer` function for computation.
+
+        :param weight:
+        :param bias:
+        :param input_zero_point:
+        :param output_zero_point:
+        :param input_scale:
+        :param weight_scale:
+        :param output_scale:
+        :param feature_bit_width:
+        :param weight_bit_width:
+        """
+
+        super().__init__()
+        # current version Pytorch does not support IntTensor as nn.Parameter
+        self.register_buffer('weight', weight)
+        self.register_buffer('bias', bias)
+
+        self.input_zero_point = input_zero_point
+        self.output_zero_point = output_zero_point
+
+        self.input_scale = input_scale
+        self.register_buffer('weight_scale', weight_scale)
+        self.output_scale = output_scale
+
+        self.feature_bit_width = feature_bit_width
+        self.weight_bit_width = weight_bit_width
+
+    def forward(self, x):
+        return quantized_linear_layer(
+            x, self.weight, self.bias,
+            self.feature_bit_width, self.weight_bit_width,
+            self.input_zero_point, self.output_zero_point,
+            self.input_scale, self.weight_scale, self.output_scale
+        )
+
+
+class QuantizedMaxPool2d(torch.nn.MaxPool2d):
+    """
+    A quantized version of the MaxPool2d layer. This layer applies max pooling in floating point
+    precision and converts the result back to int8, which is suitable for quantized models.
+
+    Since PyTorch currently does not support integer-based max pooling, the input is first
+    cast to float, max pooling is applied in float, and the output is converted back to int8.
+    """
+    def forward(self, x):
+        # current version PyTorch does not support integer-based MaxPool
+        return super().forward(x.float()).to(torch.int8)
+
+
+class QuantizedAvgPool2d(torch.nn.AvgPool2d):
+    """
+    A quantized version of the AvgPool2d layer. This layer applies average pooling in floating point
+    precision, adjusts for quantization scale differences between input and output, and converts the result
+    back to int8.
+    """
+    def forward(self, x):
+        # current version PyTorch does not support integer-based AvgPool
+        return super().forward(x.float()).to(torch.int8)
+
+
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
@@ -858,11 +988,11 @@ if __name__ == "__main__":
     # Commonly done in quantized networks - BN is just a scaling and a shifting operation
     # For reducing the compute during interference it can be added as a multiplication and a bias
     # ---------------------------------------------------------------------------------------------
-    print("Fusing BN and Convolutional layers for inference efficiency")
+    print("Fusing BN and Convolutional layers for inference efficiency ...")
 
     # Load original model
     net.load_state_dict(torch.load(saved_model_file, weights_only=True))
-    print('Before conv-bn fusion backbone length', len(net.backbone))
+    print('\tBefore conv-bn fusion model backbone length', len(net.backbone))
 
     model_fused = copy.deepcopy(net)
 
@@ -879,7 +1009,7 @@ if __name__ == "__main__":
             ptr += 1
 
     model_fused.backbone = torch.nn.Sequential(*fused_backbone)
-    print('After conv-bn fusion: backbone length', len(model_fused.backbone))
+    print('\tAfter  conv-bn fusion model backbone length', len(model_fused.backbone))
 
     # sanity check, no BN anymore
     for m in model_fused.modules():
@@ -892,6 +1022,7 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------------------------
     # Find r_min/r_max of for input and outputs quantization
     # ---------------------------------------------------------------------------------------------
+    print("Finding input/output r_max & r_min for all network layers ...")
     # add hook to record the min max value of the activation
     input_activation_ranges = {}
     output_activation_ranges = {}
@@ -899,24 +1030,138 @@ if __name__ == "__main__":
     model_hooks = add_range_recoder_hooks(model_fused, input_activation_ranges, output_activation_ranges)
 
     # Pass some same data
-    n_samples = 500
+    n_samples = 5
     for s_idx in range(n_samples):
         sample_input = iter(train_loader).__next__()[0]  # just the input
         model_fused(sample_input.to(device))
-
-        import pdb
-        pdb.set_trace()
 
     # remove hooks
     for h in model_hooks:
         h.remove()
 
     # print min max values for each layer:
+    print("\tInput activation ranges")
     for k, v in input_activation_ranges.items():
-        print(f"Input {k}: min {v.r_min}, max = {v.r_max}")
+        print(f"\t\tInput {k}: min {v.r_min:0.2f}, max = {v.r_max:0.2f}")
+
+    print("\tOutput activation ranges")
+    for k, v in output_activation_ranges.items():
+        print(f"\t\tOutput {k}: min {v.r_min:0.2f}, max = {v.r_max:0.2f}")
 
     # ----------------------------------------------------------------------------------------
+    # Convert a fp model to its quantized version for inference.
     # ----------------------------------------------------------------------------------------
+    f_bit_width = 8  # Feature bit-width
+    w_bit_width = 8  # weight bit-width
+
+    quantized_model = copy.deepcopy(model_fused)
+
+    quantized_backbone = []
+
+    ptr = 0
+    while ptr < len(quantized_model.backbone):
+        if (isinstance(quantized_model.backbone[ptr], torch.nn.Conv2d) and
+                isinstance(quantized_model.backbone[ptr + 1], torch.nn.ReLU)):
+
+            conv = quantized_model.backbone[ptr]
+            conv_name = f'backbone.{ptr}'
+
+            relu = quantized_model.backbone[ptr + 1]
+            relu_name = f'backbone.{ptr + 1}'
+
+            # Get input scale and zero point scales
+            i_r_min, i_r_max = input_activation_ranges[conv_name]
+
+            i_scale, i_zp = get_quantization_scale_and_zero_point(torch.tensor([i_r_min, i_r_max]), f_bit_width)
+
+            # Get output scale and zero point
+            o_r_min, o_r_max = output_activation_ranges[conv_name]
+            o_scale, o_zp = get_quantization_scale_and_zero_point(torch.tensor([o_r_min, o_r_max]), f_bit_width)
+
+            # Symmetric Quantize Weights
+            quantized_w, scale_w, zp_w = (
+                linear_quantize_symmetric_weight_per_output_channel(conv.weight.data, w_bit_width))
+
+            # Symmetric quantize bias
+            quantized_b, scale_b, zp_b = \
+                linear_quantize_symmetric_bias_per_output_channel(conv.bias.data, scale_w, i_scale)
+
+            # Shifted quantized bias - precompute of quantized conv operation
+            shifted_quantized_b = shift_quantized_conv2d_bias(quantized_b, quantized_w, i_zp)
+
+            quantized_conv = QuantizedConv2d(
+                quantized_w, shifted_quantized_b, i_zp, o_zp, i_scale, scale_w, o_scale,
+                conv.stride, conv.padding, conv.dilation, conv.groups,
+                feature_bit_width=f_bit_width, weight_bit_width=w_bit_width)
+
+            quantized_backbone.append(quantized_conv)
+            ptr += 2
+
+        elif isinstance(quantized_model.backbone[ptr], torch.nn.MaxPool2d):
+            quantized_backbone.append(QuantizedMaxPool2d(
+                kernel_size=quantized_model.backbone[ptr].kernel_size,
+                stride=quantized_model.backbone[ptr].stride
+            ))
+            ptr += 1
+
+        elif isinstance(quantized_model.backbone[ptr], torch.nn.AvgPool2d):
+            quantized_backbone.append(QuantizedAvgPool2d(
+                kernel_size=quantized_model.backbone[ptr].kernel_size,
+                stride=quantized_model.backbone[ptr].stride
+            ))
+            ptr += 1
+
+        else:
+            raise NotImplementedError(type(quantized_model.backbone[ptr]))  # should not happen
+
+    quantized_model.backbone = torch.nn.Sequential(*quantized_backbone)
+
+    # finally, quantized the classifier
+    fc_name = 'classifier'
+    fc = net.classifier
+
+    i_fc_r_min, i_fc_r_max = input_activation_ranges[fc_name]
+    i_fc_scale, i_fc_zp = get_quantization_scale_and_zero_point(torch.tensor([i_fc_r_min, i_fc_r_max]), f_bit_width)
+
+    o_fc_r_min, o_fc_r_max = output_activation_ranges[fc_name]
+    o_fc_scale, o_fc_zp = get_quantization_scale_and_zero_point(torch.tensor([o_fc_r_min, o_fc_r_max]), f_bit_width)
+
+    quantized_fc_w, scale_fc_w, zp_fc_w = (
+        linear_quantize_symmetric_weight_per_output_channel(fc.weight.data, w_bit_width))
+
+    quantized_fc_b, scale_fc_b, zp_fc_b = \
+        linear_quantize_symmetric_bias_per_output_channel(fc.bias.data, scale_fc_w, i_fc_scale)
+
+    shifted_quantized_b = shift_quantized_linear_bias(quantized_fc_b, quantized_fc_w, i_fc_zp)
+
+    quantized_model.classifier = QuantizedLinear(
+        quantized_fc_w, shifted_quantized_b,
+        i_fc_zp, o_fc_zp, i_fc_scale, scale_fc_w, o_fc_scale,
+        feature_bit_width=f_bit_width, weight_bit_width=w_bit_width)
+
+    # print the model
+    print(quantized_model)
+
+    # ---------------------------------------------------------------------------------------------
+    # Evaluate the quantized model
+    # ---------------------------------------------------------------------------------------------
+    def quantize_model_inputs(x):
+        """
+
+        :param x:
+        :return:
+        """
+        x = x * 255
+        x = x.round()
+        x = x - 128
+
+        return x.clamp(-128, 127).to(torch.int8)
+
+    extra_preprocess = [quantize_model_inputs]
+
+    int8_model_accuracy = train_cifar10.evaluate(quantized_model, test_loader, device, extra_preprocess)
+
+    print(f"int8 model has accuracy={int8_model_accuracy:.2f}%")
 
     import pdb
     pdb.set_trace()
