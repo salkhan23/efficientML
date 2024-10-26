@@ -42,12 +42,12 @@ def get_cifar10_datasets_and_data_loaders(data_dir, b_size):
         transforms.ToTensor(),
         transforms.RandomHorizontalFlip(),
         transforms.RandomCrop(32, 4),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))  # normalizes inputs to range -1, 1
     ])
 
     transforms_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))  # normalizes inputs to range -1, 1
     ])
 
     train_set = torchvision.datasets.CIFAR10(
@@ -82,7 +82,22 @@ def get_cifar10_datasets_and_data_loaders(data_dir, b_size):
     return train_set, train_loader, test_set, test_loader, classes
 
 
-def evaluate(model, data_loader, device):
+def evaluate(model, data_loader, device, pre_process_cbs=None):
+    """
+    Evaluates a model's performance on a given dataset.
+
+    This function runs the model in evaluation mode on a dataset provided by the data loader.
+    It optionally applies preprocessing callbacks on the input data, performs inference, and
+    computes the accuracy of the model by comparing predicted outputs to the ground truth labels.
+
+    :param model:
+    :param data_loader:
+    :param device:
+    :param pre_process_cbs: A list of preprocessing callback functions  applied sequentially to each batch of inputs.
+           Defaults to None.
+
+    :return:
+    """
     model.eval()
 
     n_samples = 0
@@ -91,6 +106,12 @@ def evaluate(model, data_loader, device):
     for inputs, labels in tqdm(data_loader, desc="eval", leave=False,):
         # Move the data from CPU to GPU
         inputs = inputs.to(device)
+
+        inputs = inputs.cuda()
+        if pre_process_cbs is not None:
+            for preprocess in pre_process_cbs:
+                inputs = preprocess(inputs)
+
         targets = labels.to(device)
 
         # Inference
