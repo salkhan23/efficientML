@@ -167,16 +167,10 @@ def get_quantization_scale_and_zero_point(fp_tensor, bit_width):
     r_max = fp_tensor.max().item()
     r_min = fp_tensor.min().item()
 
-    # Calculate scale
-    if r_max == r_min:
-        scale = 0.0  # Handle edge case where range is zero
-        zero_point = q_min  # Set zero_point to q_min
+    scale = (r_max - r_min) / (q_max - q_min)
 
-    else:
-        scale = (r_max - r_min) / (q_max - q_min)
-
-        zero_point = q_min - (r_min / scale)
-        zero_point = int(round(zero_point))
+    zero_point = q_min - (r_min / scale)
+    zero_point = int(round(zero_point))
 
     # Clamp zero_point to q_max, q_min range
     zero_point = min(max(zero_point, q_min), q_max)
