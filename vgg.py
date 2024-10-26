@@ -51,10 +51,23 @@ class VGG(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # backbone: [N, 3, 32, 32] => [N, 512, 2, 2]
+
         x = self.backbone(x)
 
-        # avg pool: [N, 512, 2, 2] => [N, 512]
-        x = x.mean([2, 3])  # torch.mean(x, dimensions)
+        # Average pooling to reduce spatial dimensions
+        # Input shape: [N, 512, 2, 2]  --> Output shape: [N, 512]
+        # Handling quantized layers: torch.mean does not support int8 variables
+        original_dtype = x.dtype  # Store the original data type of x
+
+        # Calculate the mean based on the original data type
+        if original_dtype in [torch.int8]:
+            # For int8 or char types, calculate mean using integer arithmetic
+            x = x.sum(dim=[2, 3]) // (x.shape[2] * x.shape[3])  # Compute integer mean
+
+        else:
+            x = x.float().mean(dim=[2, 3])  # Compute floating-point mean
+
+        x = x.to(original_dtype)  # Convert the mean output back to the original data type
 
         # classifier: [N, 512] => [N, 10]
         x = self.classifier(x)
