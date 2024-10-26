@@ -1,5 +1,5 @@
 # -------------------------------------------------------------------------------------------------
-# Linear Quantization of Neural Networks
+# Linear Quantization for Neural Networks
 # Affine Transformation for activations and Symmetric Quantization for weights and biases
 # -------------------------------------------------------------------------------------------------
 import matplotlib.pyplot as plt
@@ -966,22 +966,22 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------------------------
     # Quantize Model Weights
     # ---------------------------------------------------------------------------------------------
-    # # Distribution of weights of the floating point model
-    # plot_weight_distributions(net, extra_title='Floating point model')
-    #
-    # # Quantize model weights and plot weight distributions
-    # quantized_bit_widths = [2, 4, 8]
-    #
-    # for q_bit_width in quantized_bit_widths:
-    #     quantize_model_weights(net, q_bit_width)
-    #
-    #     plot_weight_distributions(net, q_bit_width, extra_title="Quantized")
-    #
-    #     # quant_model_acc = train_cifar10.evaluate(net, test_loader, device)
-    #     # print(f"{q_bit_width}-bit quantized model accuracy (without fine-tuning) {quant_model_acc:0.2f}")
-    #
-    #     # Restore the model
-    #     net.load_state_dict(torch.load(saved_model_file, weights_only=True))
+    # Distribution of weights of the floating point model
+    plot_weight_distributions(net, extra_title='Floating point model')
+
+    # Quantize model weights and plot weight distributions
+    quantized_bit_widths = [ 8]
+
+    for q_bit_width in quantized_bit_widths:
+        quantize_model_weights(net, q_bit_width)
+
+        plot_weight_distributions(net, q_bit_width, extra_title="Quantized")
+
+        # quant_model_acc = train_cifar10.evaluate(net, test_loader, device)
+        # print(f"{q_bit_width}-bit quantized model accuracy (without fine-tuning) {quant_model_acc:0.2f}")
+
+        # Restore the model
+        net.load_state_dict(torch.load(saved_model_file, weights_only=True))
 
     # ---------------------------------------------------------------------------------------------
     # Fuse Convolutional & BN layer
@@ -1016,8 +1016,8 @@ if __name__ == "__main__":
         assert not isinstance(m, torch.nn.BatchNorm2d)
 
     # Accuracy should remain the same after fusion
-    # fused_acc = train_cifar10.evaluate(model_fused, test_loader, device)
-    # print(f'Accuracy of the fused model={fused_acc:.2f}%')
+    fused_acc = train_cifar10.evaluate(model_fused, test_loader, device)
+    print(f'Accuracy of the fused model={fused_acc:.2f}%')
 
     # ---------------------------------------------------------------------------------------------
     # Find r_min/r_max of for input and outputs quantization
@@ -1069,13 +1069,22 @@ if __name__ == "__main__":
             relu = quantized_model.backbone[ptr + 1]
             relu_name = f'backbone.{ptr + 1}'
 
-            # Get input scale and zero point scales
+            # # Get input scale and zero point scales
+            # if ptr == 0:
+            #     # The input to the model is also scaled. to range (-127,128)
+            #     i_scale = 1 / 2**-7
+            #     i_zp = 0
+            # else:
             i_r_min, i_r_max = input_activation_ranges[conv_name]
-
             i_scale, i_zp = get_quantization_scale_and_zero_point(torch.tensor([i_r_min, i_r_max]), f_bit_width)
 
             # Get output scale and zero point
-            o_r_min, o_r_max = output_activation_ranges[conv_name]
+            # Quantize the output after applying the ReLU activation on the Conv layer's output.
+            # This approach ensures that we only consider non-negative activations, which accurately
+            # reflects the values that will be fed into the subsequent layers.
+            # Quantize range is only spread over (0, r_max) which gives higher resolution to the values that
+            # matter. Also do not need to include the relu operation either.
+            o_r_min, o_r_max = output_activation_ranges[relu_name]
             o_scale, o_zp = get_quantization_scale_and_zero_point(torch.tensor([o_r_min, o_r_max]), f_bit_width)
 
             # Symmetric Quantize Weights
@@ -1147,13 +1156,9 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------------------------
     def quantize_model_inputs(x):
         """
-
-        :param x:
-        :return:
+        Quantizes input data in range [-1,1] by scaling to a symmetric range of [-128, 127] and converting to int8.
         """
-        x = x * 255
-        x = x.round()
-        x = x - 128
+        x = (x + 1) * 128 - 128
 
         return x.clamp(-128, 127).to(torch.int8)
 
