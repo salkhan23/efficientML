@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 
 def show_image(img, title=None):
-    img = img / 2 + 0.5  # unnormalize
+    img = img / 2 + 0.5  # un-normalize
     npimg = img.numpy()
     plt.imshow(np.transpose(npimg, (1, 2, 0)))
     plt.title(title)
@@ -124,10 +124,10 @@ def evaluate(model, data_loader, device, pre_process_cbs=None):
         n_samples += labels.size(0)
         n_correct += (outputs == targets).sum()
 
-    return (n_correct / n_samples * 100).item()
+    return n_correct / n_samples * 100
 
 
-def save_model(model, best_model_state_dict, save_dir, best_test_acc, n_epochs):
+def save_model(model, save_dir, best_test_acc, n_epochs):
 
     save_file_name = \
         f'./{datetime.now().strftime("%d-%m-%Y")}_{model.__class__.__name__}' \
@@ -135,9 +135,11 @@ def save_model(model, best_model_state_dict, save_dir, best_test_acc, n_epochs):
 
     os.makedirs(save_dir, exist_ok=True)
     save_file_path = os.path.join(save_dir, save_file_name)
-    torch.save(best_model_state_dict, save_file_path)
+    torch.save(model.state_dict(), save_file_path)
 
     print(f'Model saved to {save_file_path}')
+
+    return save_file_path
 
 
 def train(
@@ -157,7 +159,6 @@ def train(
 
     n_samples = 0
     n_correct = 0
-    train_acc = 0
 
     for inputs, targets in tqdm(dataloader, desc='train', leave=False):
         # Move the data from CPU to GPU
@@ -195,7 +196,7 @@ def train(
     return train_acc
 
 
-def main(b_size, random_seed=10, data_dir='./data', save_dir=None, n_epochs=10, lr=1e-2):
+def main(b_size, model, random_seed=10, data_dir='./data', save_dir=None, n_epochs=10, lr=1e-2):
 
     np.random.seed(random_seed)
     torch.random.manual_seed(random_seed)
@@ -218,22 +219,17 @@ def main(b_size, random_seed=10, data_dir='./data', save_dir=None, n_epochs=10, 
     # f.suptitle(' '.join(f'{classes[labels[j]]:5s}' for j in range(batch_size)))
 
     # Model ---------------------------------------------------------------------------------------
-    net = VGG()
-    net.to(device)
+    model.to(device)
 
     criterion = nn.CrossEntropyLoss()
 
-    optimizer = optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-2)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
     # optimizer = optim.Adam(net.parameters(), lr=lr)
     # optimizer = optim.SGD(net.parameters(), lr=lr, momentum=0.9)
 
     lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 
     # Training ------------------------------------------------------------------------------------
-    train_start_time = datetime.now()
-
-    best_test_acc = 0
-    best_model = None
 
     # Track  the best model and accuracy
     best_model_state = None
@@ -253,7 +249,7 @@ def main(b_size, random_seed=10, data_dir='./data', save_dir=None, n_epochs=10, 
 
         # Train the model for one epoch using the train function
         train_acc = train(
-            model=net,
+            model=model,
             dataloader=train_loader,
             criterion=criterion,
             optimizer=optimizer,
@@ -262,19 +258,20 @@ def main(b_size, random_seed=10, data_dir='./data', save_dir=None, n_epochs=10, 
         )
 
         # Evaluate the model on the test set after each epoch
-        test_acc = evaluate(net, test_loader, device)
+        test_acc = evaluate(model, test_loader, device)
         # print(f"Test Accuracy after Epoch {epoch + 1}: {test_acc:.2f}%")
 
         # Check if this is the best model so far
         if test_acc > best_test_acc:
             best_test_acc = test_acc
-            best_model_state = net.state_dict()
+            best_model_state = model.state_dict()
             # print(f"New Best Model found at Epoch {epoch + 1} with Test Accuracy: {best_test_acc:.2f}%")
 
     # Save the best model to the specified directory
+    save_model_file = None
     if save_dir is not None and best_model_state is not None:
-        net.load_state_dict(best_model_state)  # Load best model state
-        save_model(model=net, save_dir=save_dir, n_epochs=n_epochs, best_test_acc=best_test_acc)
+        model.load_state_dict(best_model_state)  # Load best model state
+        save_model_file = save_model(model=model, save_dir=save_dir, n_epochs=n_epochs, best_test_acc=best_test_acc)
         print(f"Best Model Saved with Test Accuracy: {best_test_acc:.2f}%")
 
     # Calculate and print the total training duration
@@ -283,8 +280,7 @@ def main(b_size, random_seed=10, data_dir='./data', save_dir=None, n_epochs=10, 
 
     print("Training Completed!")
 
-    import pdb
-    pdb.set_trace()
+    return save_model_file
 
 
 if __name__ == "__main__":
@@ -297,9 +293,21 @@ if __name__ == "__main__":
     else:
         print("CUDA is not available. Moving model to CPU...")
 
-    main(
+    net = VGG()
+
+    saved_model_file = main(
         b_size=batch_size,
+        model=net,
         data_dir=data_directory,
         n_epochs=100,
-        lr=1e-2
+        lr=1e-2,
+        save_dir='/home/salman/workspace/pytorch/efficientML/results_trained_models'
     )
+
+    # Load the model again and evaluate its accuracy
+    train_data_set_1, train_loader_1, test_data_set_1, test_loader_1, classes_1 = (
+        get_cifar10_datasets_and_data_loaders(data_dir=data_directory, b_size=batch_size))
+
+    net.load_state_dict(torch.load(saved_model_file, weights_only=True))
+    final_test_acc = evaluate(net, test_loader_1, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"Final Test Accuracy: {final_test_acc:.2f}%")
