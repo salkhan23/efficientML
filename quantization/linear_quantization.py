@@ -1,6 +1,17 @@
 # -------------------------------------------------------------------------------------------------
-# Linear Quantization for Neural Networks
-# Affine Transformation for activations and Symmetric Quantization for weights and biases
+#  Linear Quantization of Neural networks
+#
+#  Affine (symmetric) quantization ofr input & output activations
+#  Symmetric quantization for model weights.
+#
+#  Does:
+#    [1] Quantizes a model for linear operation
+#
+#  Todo:
+#   [1] Validation of convolutional layer
+#   [2] Post-quantization fine tuning
+
+#  Reference: https://colab.research.google.com/drive/11IBla1q1McoZ2oCANCGHns8VtzG5nCMP
 # -------------------------------------------------------------------------------------------------
 import matplotlib.pyplot as plt
 import copy
@@ -14,14 +25,29 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
 
-from vgg import VGG  # noqa: E402  (ignore module import not at top)
+from vgg import VGG   # noqa: E402  (ignore module import not at top)
 import train_cifar10  # noqa: E402  (ignore module import not at top)
 
 
-def linear_quantize(
-        fp_tensor, bit_width, scale: torch.Tensor | float, zero_point: torch.Tensor | int,
+def get_quantize_range(bit_width):
+    """ [2**(bit_width - 1), 2**(bit_width - 1) -1]. E.g. bit_width = 8: (-128, 127) """
+    q_max = (1 << (bit_width - 1)) - 1
+    q_min = -(1 << (bit_width - 1))
+    return q_min, q_max
+
+
+# -------------------------------------------------------------------------------------------------
+#  Linear Quantization Functions
+# -------------------------------------------------------------------------------------------------
+def linear_quantize_with_scale_and_zero_point(
+        fp_tensor,
+        bit_width,
+        scale: torch.Tensor | float,
+        zero_point: torch.Tensor | int,
         dtype=torch.int8) -> torch.Tensor:
     """
+    Quantize a given floating point tensor (fp_tensor) to bit_width bits, using the given scale and zero point
+
     The quantization process is defined as:
         r = S(q - Z)
         q = int(round(r/S)) + Z
@@ -42,7 +68,7 @@ def linear_quantize(
     :return: Quantized tensor with specified bit-width.
     """
     assert (fp_tensor.dtype == torch.float), \
-        f"floating point tensor should have a data type of torch.float.f Found {fp_tensor.dtype}"
+        f"fp_tensor should have a data type of torch.float. Found {fp_tensor.dtype}"
 
     # Ensure scale and zero_point are of valid types and dimensions
     assert isinstance(scale, float) or (scale.dtype == torch.float and scale.dim() == fp_tensor.dim()), \
@@ -66,11 +92,54 @@ def linear_quantize(
     return quantized_tensor
 
 
-def get_quantize_range(bit_width):
-    """ [2**(bit_width - 1), 2**(bit_width - 1) -1]. E.g. bit_width = 8: (-128, 127) """
-    q_max = (1 << (bit_width - 1)) - 1
-    q_min = -(1 << (bit_width - 1))
-    return q_min, q_max
+def get_quantization_scale_and_zero_point(fp_tensor, bit_width):
+    """
+    Get quantization scale and zero point for single tensor (general, no assumptions method)
+
+    S = (r_max - r_min) / (q_max - q_min)
+    Z = q_min - int(round(r_min/S))
+
+    r_max, r_min of the fp_tensor are calculated internally.
+
+    :param fp_tensor: [torch.(cuda.)Tensor] floating tensor to be quantized
+    :param bit_width: [int] quantization bit width
+
+    :return: scale (float), zero_point (int)
+    """
+    q_min, q_max = get_quantize_range(bit_width)
+
+    r_max = fp_tensor.max().item()
+    r_min = fp_tensor.min().item()
+
+    # Scale
+    scale = (r_max - r_min) / (q_max - q_min)
+
+    # Zero point
+    zero_point = q_min - (r_min / scale)
+    zero_point = int(round(zero_point))
+
+    # Clamp zero_point to q_max, q_min range
+    zero_point = min(max(zero_point, q_min), q_max)
+
+    return scale, zero_point
+
+
+def linear_quantize_affine(fp_tensor, bit_width):
+    """
+    linear quantize fp-tensor (general no assumptions)
+
+    Calculates scale and zero point of the fp_tensor, then quantizes it.
+
+    :param fp_tensor: [torch.(cuda.)Tensor] floating feature to be quantized
+    :param bit_width: [int] quantization bit width
+
+    :return: quantized tensor ([torch.(cuda.)Tensor] ), scale tensor (float), zero point (int)
+    """
+    scale, zero_point = get_quantization_scale_and_zero_point(fp_tensor, bit_width)
+
+    quantized_tensor = linear_quantize_with_scale_and_zero_point(fp_tensor, bit_width, scale, zero_point)
+
+    return quantized_tensor, scale, zero_point
 
 
 def test_linear_quantize(
@@ -120,9 +189,9 @@ def test_linear_quantize(
     q_min, q_max = get_quantize_range(bit_width)
 
     fig, axes = plt.subplots(1, 3, figsize=(10, 5))
-    plot_matrix(test_tensor, axes[0], 'original tensor', vmin=real_min, vmax=real_max)
+    plot_matrix(test_tensor, axes[0], 'original tensor', vmin=real_min, vmax=real_max, cmap='bwr')
 
-    _quantized_test_tensor = linear_quantize(
+    _quantized_test_tensor = linear_quantize_with_scale_and_zero_point(
         test_tensor,
         bit_width=bit_width,
         scale=scale,
@@ -140,81 +209,31 @@ def test_linear_quantize(
 
     plot_matrix(
         _quantized_test_tensor, axes[1], f'{bit_width}-bit linear quantized tensor',
-        vmin=q_min, vmax=q_max, cmap='tab20c')
+        vmin=q_min, vmax=q_max, cmap='bwr')
 
     plot_matrix(
-        _reconstructed_test_tensor, axes[2], f'reconstructed tensor', vmin=real_min, vmax=real_max, cmap='tab20c')
+        _reconstructed_test_tensor, axes[2], f'reconstructed tensor', vmin=real_min, vmax=real_max, cmap='bwr')
 
     fig.tight_layout()
     plt.show()
 
 
-def get_quantization_scale_and_zero_point(fp_tensor, bit_width):
-    """
-    get quantization scale and zero point for single tensor
-
-    S = (r_max - r_min) / (q_max - q_min)
-    Z = q_min - int(round(r_min/S))
-
-    :param fp_tensor: [torch.(cuda.)Tensor] floating tensor to be quantized
-    :param bit_width: [int] quantization bit width
-
-    :return:
-        [float] scale
-        [int] zero_point
-    """
-    q_min, q_max = get_quantize_range(bit_width)
-    r_max = fp_tensor.max().item()
-    r_min = fp_tensor.min().item()
-
-    scale = (r_max - r_min) / (q_max - q_min)
-
-    zero_point = q_min - (r_min / scale)
-    zero_point = int(round(zero_point))
-
-    # Clamp zero_point to q_max, q_min range
-    zero_point = min(max(zero_point, q_min), q_max)
-
-    return scale, zero_point
-
-
-def linear_quantize_affine(fp_tensor, bit_width):
-    """
-    linear quantization to given fp-tensor.
-
-    Most general form of linear quantization - Calculates scale and zero point using max, min
-    of fp_tensor
-
-    :param fp_tensor: [torch.(cuda.)Tensor] floating feature to be quantized
-    :param bit_width: [int] quantization bit width
-    :return:
-        [torch.(cuda.)Tensor] quantized tensor
-        [float] scale tensor
-        [int] zero point
-    """
-    scale, zero_point = get_quantization_scale_and_zero_point(fp_tensor, bit_width)
-
-    quantized_tensor = linear_quantize(fp_tensor, bit_width, scale, zero_point)
-
-    return quantized_tensor, scale, zero_point
-
-
+# -------------------------------------------------------------------------------------------------
+#  Symmetric Linear Quantization Functions
+# -------------------------------------------------------------------------------------------------
 def get_symmetric_quantization_scale(fp_tensor, bit_width):
     """
-    get symmetric quantization scale for fp_tensor
+    Get symmetric quantization scale for fp_tensor
 
-    In symmetric quantization
-        (1) r_max = - r_min = max(abs(fp_tensor))
-        (2) zero-point = 0
+        S = r_max / q_max
+        Z = 0
 
-    S = r_max / q_max
-    Z = 0
+    In symmetric quantization, r_max = - r_min = max(abs(fp_tensor))
 
     :param fp_tensor: [torch.(cuda.)Tensor] floating weight to be quantized
     :param bit_width: [integer] quantization bit width
 
-    :return:
-        [floating scalar] scale
+    :return: scale (float)
     """
     r_max = max(fp_tensor.abs().max().item(), 5e-7)
 
@@ -227,18 +246,17 @@ def get_symmetric_quantization_scale(fp_tensor, bit_width):
 
 def linear_quantize_symmetric_weight_per_output_channel(fp_weight, bit_width):
     """
-    Apply symmetric per_channel (output channels) quantization to given 4D fp_tensor  [ch_out, ch_in, r, c].
+    Apply symmetric per (output) channel quantization to given 4D fp_tensor  [ch_out, ch_in, r, c].
 
-    In symmetric quantization
-        (1) r_max = - r_min = max(abs(fp_tensor))
-        (2) zero-point = 0
+        S = r_max / q_max
+        Z = 0
 
-    S = r_max / q_max
-    Z = 0
+        where:  r_max = - r_min = max(abs(fp_tensor))
 
     :param fp_weight:
     :param bit_width:
-    :return:
+
+    :return: quantized tensor ([torch.(cuda.)Tensor] ), scale tensor (float), zero point (int)
     """
     n_ch_out = fp_weight.shape[0]
 
@@ -250,32 +268,36 @@ def linear_quantize_symmetric_weight_per_output_channel(fp_weight, bit_width):
 
     # Modify scale so it is easily broadcast.
     # Same shape as fp_tensor, but with all dimensions other than the output dimension = 1.
-    # Pytorch will automatically duplicate scale to the same shape as fp_tensor according to broadcasting rules
+    # Pytorch will automatically duplicate scale to the same shape as fp_tensor (broadcasting)
     scale_shape = [1] * fp_weight.dim()
     scale_shape[0] = -1
     scales_per_channel = scales_per_channel.view(scale_shape)
 
     # now quantize fp_tensor
-    quantized_weight = linear_quantize(fp_weight, bit_width, scales_per_channel, 0)
+    quantized_weight = linear_quantize_with_scale_and_zero_point(
+        fp_weight, bit_width, scales_per_channel, 0)
 
     return quantized_weight, scales_per_channel, 0
 
 
 def linear_quantize_symmetric_bias_per_output_channel(fp_bias, w_scale, input_scale):
     """
-    Apply symmetric quantization for bias term.
+    Apply symmetric quantization to the bias term for each output channel.
 
-    Note: this does not calculate its own bias, to simplify network layer output quantization,
-    the scale is assumed to be weight_scale * input Scale
+    This function scales the floating-point bias (`fp_bias`) using the product of the weight scale
+    and the input scale. It assumes the zero point is zero.
 
-    S = S_w * S_x
-    Z = 0
+    Part of the linear layer quantization process (see quantized_linear_layer).
+
+    Quantization formulas:
+        S = S_w * S_x  (scale)
+        Z = 0          (zero point)
 
     :param fp_bias: [torch.FloatTensor] bias weight to be quantized
     :param w_scale: [float or torch.FloatTensor] weight scale tensor
     :param input_scale: [float] input scale
-    :return:
-        [torch.IntTensor] quantized bias tensor
+
+    :return: quantized tensor ([torch.(cuda.)Tensor] ), scale tensor (float), zero point (int)
     """
     assert fp_bias.dim() == 1, "Bias tensor must be 1D (one bias per output channel)."
     assert fp_bias.dtype == torch.float, "Bias tensor must be of type torch.float."
@@ -283,103 +305,98 @@ def linear_quantize_symmetric_bias_per_output_channel(fp_bias, w_scale, input_sc
 
     if isinstance(w_scale, torch.Tensor):
         assert w_scale.dtype == torch.float, "Weight scale tensor must be of type torch.float."
-        w_scale = w_scale.view(-1)  # Flatten to 1D if needed
+        w_scale = w_scale.view(-1)  # Flatten to 1D
         assert fp_bias.numel() == w_scale.numel(), \
             f"Weight scale size ({w_scale.numel()}) must match the bias size ({fp_bias.numel()})."
 
     scale = w_scale * input_scale
 
-    quantized_bias = linear_quantize(fp_bias, 32, scale, 0, dtype=torch.int32)
+    # Fix 32 bit quantization is used for the bias.
+    quantized_bias = linear_quantize_with_scale_and_zero_point(
+        fp_bias, 32, scale, 0, dtype=torch.int32)
 
     return quantized_bias, scale, 0
 
 
+# -------------------------------------------------------------------------------------------------
+#  Full Layer Linear Quantization
+# -------------------------------------------------------------------------------------------------
 def shift_quantized_linear_bias(quantized_bias, quantized_weight, input_zero_point):
     """
-    Computes the shifted bias for quantized linear layers (Q_bias).
-
-    In quantized inference, the output of a dense (fully-connected) layer is represented as:
-
-    q_y = (S_x * S_w / S_y) * (q_w * q_x + q_b - Z_x * sum(q_w)) + Z_y
-
-    This function calculates the pre-computable portion of the equation:
-
-    shifted_bias = q_b - Z_x * sum(q_w)
-
+    Computes the pre-computable shifted bias for quantized linear layer
     where:
-    - q_b: quantized bias
-    - Z_x: input zero-point
-    - sum(q_w): sum of quantized weights for each output channel (assumes per-channel quantization)
 
-    Precomputing the shifted bias helps optimize inference by reducing the need to recompute
-    the bias shift during each forward pass.
+        shifted_bias = q_b - Z_x * sum(q_w)
 
-    Assumptions:
-    - Symmetric quantization for weights.
-    - Symmetric quantization for bias, with the bias scale defined as S_x * S_w.
+        - q_b: quantized bias
+        - Z_x: input zero-point
+        - sum(q_w): sum of quantized weights for each output channel (assumes per-channel quantization)
+
+    Part of the linear layer quantization process (see quantized_linear_layer).
 
     :param quantized_bias: [torch.IntTensor] Quantized bias (should be int32).
     :param quantized_weight: [torch.CharTensor] Quantized weights (should be int8).
     :param input_zero_point: [int] Input zero-point (int).
 
-    :return:
-        [torch.IntTensor] Shifted quantized bias tensor.
+    :return: Shifted quantized bias tensor. [n_out_ch]
     """
     assert (quantized_bias.dtype == torch.int32), \
         f"Expected bias to be of type torch.float, but got {quantized_bias.dtype}"
     assert (isinstance(input_zero_point, int)), \
-        f"Expected input zero point to be of type int, but got {input_zero_point.dtype}"
+        f"Expected input zero point to be of type int, got {type(input_zero_point)}"
 
-    # Sum = sum all weights over all input channel weights of each output channel
+    # Sum all weights over all input channel weights of each output channel
     shifted_q_bias = quantized_bias - quantized_weight.sum(1).to(torch.int32) * input_zero_point
 
     return shifted_q_bias
 
 
 def quantized_linear_layer(
-        input_x, weight, bias, feature_bit_width, weight_bit_width, input_zero_point, output_zero_point,
+        input_x, weight, shifted_q_bias, feature_bit_width, weight_bit_width, input_zero_point, output_zero_point,
         input_scale, weight_scale, output_scale):
     """
     Quantized fully-connected (linear) layer.
 
     The quantized output is computed as:
+        q_y = (Linear[q_x, q_w] + shifted_bias) * (S_x * S_w / S_y) + Z_y
 
-    q_y = (Linear[q_x, q_w] + Qbias) * (S_x * S_w / S_y) + Z_y
+    Where
+        - shifted_bias = shifted quantized bias (see shift_quantized_linear_bias)
+        - S_x = quantized input scale
+        - S_w = quantized weight scales (see linear_quantize_symmetric_bias_per_output_channel)
+        - S_y = quantized output scale
+        - Z_y = Output zero-point
 
-    Where Qbias is the shifted quantized bias:
-    Qbias = q_b - Z_x * sum(q_w) (see `shift_quantized_linear_bias` for details).
+    :param input_x: quantized input (torch.int8)
+    :param weight: quantized weight (torch.int8)
+    :param shifted_q_bias: shifted quantized bias or None (torch.int32)
+    :param feature_bit_width: quantization bit width of input and output (int)
+    :param weight_bit_width: quantization bit width of weight (int)
+    :param input_zero_point: input zero point (int)
+    :param output_zero_point: output zero point (int)
+    :param input_scale: input feature scale (float)
+    :param weight_scale: weight per-channel scale (torch.FloatTensor)
+    :param output_scale: output feature scale (float)
 
-
-    :param input_x: [torch.CharTensor] quantized input (torch.int8)
-    :param weight: [torch.CharTensor] quantized weight (torch.int8)
-    :param bias: [torch.IntTensor] shifted quantized bias or None (torch.int32)
-    :param feature_bit_width: [int] quantization bit width of input and output
-    :param weight_bit_width: [int] quantization bit width of weight
-    :param input_zero_point: [int] input zero point
-    :param output_zero_point: [int] output zero point
-    :param input_scale: [float] input feature scale
-    :param weight_scale: [torch.FloatTensor] weight per-channel scale
-    :param output_scale: [float] output feature scale
-
-    :return:
-        [torch.CharIntTensor] quantized output feature (torch.int8)
+    :return: quantized output activation (torch.int8)
     """
     assert input_x.dtype == torch.int8, f"Expected input dtype torch.int8, got {input_x.dtype}"
     assert weight.dtype == input_x.dtype, f"Expected weight dtype to match input, got {weight.dtype}"
-    assert bias is None or bias.dtype == torch.int32, f"Expected bias dtype torch.int32, got {bias.dtype}"
+    assert shifted_q_bias is None or shifted_q_bias.dtype == torch.int32, \
+        f"Expected bias dtype torch.int32, got {shifted_q_bias.dtype}"
     assert isinstance(input_zero_point, int), f"Expected input_zero_point to be int, got {type(input_zero_point)}"
     assert isinstance(output_zero_point, int), f"Expected output_zero_point to be int, got {type(output_zero_point)}"
     assert isinstance(input_scale, float), f"Expected input_scale to be float, got {type(input_scale)}"
     assert isinstance(output_scale, float), f"Expected output_scale to be float, got {type(output_scale)}"
     assert weight_scale.dtype == torch.float, f"Expected weight_scale to be float, got {weight_scale.dtype}"
 
-    # Step 1: integer-based fully-connected (8-bit multiplication with 32-bit accumulation)
+    # Step 1: int matrix multiplication (8-bit multiplication with 32-bit accumulation) and add shifted bias
     if 'cpu' in input_x.device.type:
         # use 32-b MAC for simplicity
-        output = torch.nn.functional.linear(input_x.to(torch.int32), weight.to(torch.int32), bias)
+        output = torch.nn.functional.linear(input_x.to(torch.int32), weight.to(torch.int32), shifted_q_bias)
     else:
         # current version pytorch does not yet support integer-based linear() on GPUs
-        output = torch.nn.functional.linear(input_x.float(), weight.float(), bias.float())
+        output = torch.nn.functional.linear(input_x.float(), weight.float(), shifted_q_bias.float())
 
     # Step 2: scale the output
     # Weight_scale: [oc, 1, 1, 1] -> [oc], then expanded to [1, oc] to match output shape [batch_size, oc]
@@ -421,7 +438,24 @@ def test_quantized_fc(
             [ 0,  0, -1,  0,  0,  0,  0, -1],
             [ 0,  0,  0, -1,  0,  0,  0, -1],
             [ 0,  0,  0,  0,  0,  1, -1, -2]], dtype=torch.int8),
-        bit_width=2, batch_size=4, in_channels=8, out_channels=8):
+        bit_width=2,
+        batch_size=4,
+        in_channels=8,
+        out_channels=8):
+    """
+
+    :param input_x:
+    :param weight:
+    :param bias:
+    :param quantized_bias:
+    :param shifted_quantized_bias:
+    :param calc_quantized_output:
+    :param bit_width:
+    :param batch_size:
+    :param in_channels:
+    :param out_channels:
+    :return:
+    """
 
     def plot_matrix(tensor, ax, title, vmin=0., vmax=1., cmap='bwr'):
         ax.imshow(tensor.cpu().numpy(), vmin=vmin, vmax=vmax, cmap=cmap)
@@ -450,10 +484,11 @@ def test_quantized_fc(
         linear_quantize_symmetric_bias_per_output_channel(bias, weight_scale, input_scale)
     assert _quantized_bias.equal(_quantized_bias)  # check for NaNs
 
-    # Calculated output - precompute Q_bias
+    # Calculate linear quantization output ----------------------------------------------------
+    # shifted_quantized_bias part
     _shifted_quantized_bias = \
         shift_quantized_linear_bias(quantized_bias, quantized_weight, input_zero_point)
-    assert _shifted_quantized_bias.equal(shifted_quantized_bias)  # check that values match with input
+    assert _shifted_quantized_bias.equal(shifted_quantized_bias)  # check that values match with input param
 
     # Quantize the output
     quantized_output, output_scale, output_zero_point = linear_quantize_affine(output, bit_width)
@@ -464,11 +499,9 @@ def test_quantized_fc(
         bit_width, bit_width,
         input_zero_point, output_zero_point,
         input_scale, weight_scale, output_scale)
-    assert _calc_quantized_output.equal(calc_quantized_output)  # check that values match with input
+    assert _calc_quantized_output.equal(calc_quantized_output)  # check that values match with input param
 
-    reconstructed_weight = weight_scale * (quantized_weight.float() - weight_zero_point)
-    reconstructed_input = input_scale * (quantized_input.float() - input_zero_point)
-    reconstructed_bias = bias_scale * (quantized_bias.float() - bias_zero_point)
+    # Show the reconstructed output
     reconstructed_calc_output = output_scale * (calc_quantized_output.float() - output_zero_point)
 
     fig, axes = plt.subplots(3, 3, figsize=(15, 12))
@@ -482,8 +515,13 @@ def test_quantized_fc(
                 vmin=quantized_min, vmax=quantized_max, cmap='bwr')
     plot_matrix(quantized_input.t(), axes[1, 1], f'{bit_width}-bit linear quantized input',
                 vmin=quantized_min, vmax=quantized_max, cmap='bwr')
-    plot_matrix(calc_quantized_output.t(), axes[2, 1], f'quantized output from quantized_linear()',
+    plot_matrix(calc_quantized_output.t(), axes[2, 1], f'quantized output from quantized_linear_layer()',
                 vmin=quantized_min, vmax=quantized_max, cmap='bwr')
+
+    # Show the reconstructed weights
+    reconstructed_weight = weight_scale * (quantized_weight.float() - weight_zero_point)
+    reconstructed_input = input_scale * (quantized_input.float() - input_zero_point)
+    # reconstructed_bias = bias_scale * (quantized_bias.float() - bias_zero_point)
 
     plot_matrix(reconstructed_weight, axes[0, 2], f'reconstructed weight',
                 vmin=-0.5, vmax=0.5, cmap='bwr')
@@ -502,16 +540,20 @@ def test_quantized_fc(
     plt.show()
 
 
+# -------------------------------------------------------------------------------------------------
+# Convolutional Layer quantization
+# -------------------------------------------------------------------------------------------------
 def shift_quantized_conv2d_bias(quantized_bias, quantized_weight, input_zero_point):
     """
-    Computes the shifted bias (Q_bias) for quantized convolutional layers.
+    Computes the pre-computable shifted bias for quantized conv layers
+    where:
+        shifted_bias = q_b - conv(q_w, Z_x)
 
-    shifted_bias = q_b - Conv(Z_x, q_w)
+        - q_b: quantized bias
+        - Z_x: input zero-point
+        - q_w: quantized weight [ch-out, ch_in, r, c]
 
-     where:
-    - q_b: quantized bias
-    - Z_x: input zero-point
-    - q_w: quantized weight [ch-out, ch_in, r, c]
+    Part of the conv layer quantization process (see quantized_conv_layer)
 
     Note: This function does not perform an actual convolution. Instead, it sums the weights across
     the input channels and spatial dimensions, then multiplies by the input zero point of the channel
@@ -521,8 +563,7 @@ def shift_quantized_conv2d_bias(quantized_bias, quantized_weight, input_zero_poi
     :param quantized_weight: [torch.CharTensor] quantized weight (torch.int8)
     :param input_zero_point: [int] input zero point
 
-    :return:
-        [torch.IntTensor] shifted quantized bias tensor
+    :return: shifted quantized bias tensor [n_out_ch]
     """
     assert quantized_bias.dtype == torch.int32, "Expected quantized bias to be of type int32."
     assert isinstance(input_zero_point, int), "Input zero point must be an integer."
@@ -530,35 +571,35 @@ def shift_quantized_conv2d_bias(quantized_bias, quantized_weight, input_zero_poi
     return quantized_bias - quantized_weight.sum((1, 2, 3)).to(torch.int32) * input_zero_point
 
 
-def quantized_conv2d(
-        input_x, weight, bias, feature_bit_width, weight_bit_width, input_zero_point, output_zero_point,
+def quantized_conv2d_layer(
+        input_x, weight, shifted_q_bias, feature_bit_width, weight_bit_width, input_zero_point, output_zero_point,
         input_scale, weight_scale, output_scale, stride, padding, dilation, groups):
     """
-    quantized 2d convolution
+    Quantized 2d convolution
 
-    q_y= (CONV[q_x,q_w] + Qbias)⋅(S_x* S_w/ S_y) + Z_y
+    q_y = (CONV[q_x,q_w] + shifted_bias)⋅(S_x * S_w / S_y) + Z_y
 
     :param groups:
     :param dilation:
     :param padding:
     :param stride:
-    :param input_x: [torch.CharTensor] quantized input (torch.int8)
-    :param weight: [torch.CharTensor] quantized weight (torch.int8)
-    :param bias: [torch.IntTensor] shifted quantized bias or None (torch.int32)
-    :param feature_bit_width: [int] quantization bit width of input and output
-    :param weight_bit_width: [int] quantization bit width of weight
-    :param input_zero_point: [int] input zero point
-    :param output_zero_point: [int] output zero point
-    :param input_scale: [float] input feature scale
-    :param weight_scale: [torch.FloatTensor] weight per-channel scale
-    :param output_scale: [float] output feature scale
-    :return:
-        [torch.(cuda.)CharTensor] quantized output feature
+    :param input_x: quantized input (torch.int8)
+    :param weight: quantized weight (torch.int8)
+    :param shifted_q_bias: shifted quantized bias or None (torch.int32)
+    :param feature_bit_width: quantization bit width of input and output (int)
+    :param weight_bit_width: quantization bit width of weight (int)
+    :param input_zero_point: input zero point (int)
+    :param output_zero_point: output zero point (int)
+    :param input_scale: input feature scale (float)
+    :param weight_scale:  weight per-channel scale (float tensor)
+    :param output_scale: output feature scale (float)
+
+    :return: quantized output feature (float tensor)
     """
     assert len(padding) == 4, "Padding must be a length 4 tuple."
     assert input_x.dtype == torch.int8, "Input tensor must be of type torch.int8."
     assert weight.dtype == torch.int8, "Weight tensor must be of type torch.int8."
-    assert bias is None or bias.dtype == torch.int32, "Bias must be of type torch.int32 or None."
+    assert shifted_q_bias is None or shifted_q_bias.dtype == torch.int32, "Bias must be of type torch.int32 or None."
     assert isinstance(input_zero_point, int), "Input zero point must be an integer."
     assert isinstance(output_zero_point, int), "Output zero point must be an integer."
     assert isinstance(input_scale, float), "Input scale must be a float."
@@ -566,16 +607,15 @@ def quantized_conv2d(
     assert weight_scale.dtype == torch.float, "Weight scale must be of type torch.float."
 
     # Step 1: Pad input tensor with input_zero_point
-    # In quantized neural networks, the input tensor is quantized using a zero point to represent integer values.
-    # Padding with the same zero point ensures that the padded areas align well with the quantization scheme,
-    # making the convolution operation more consistent across the entire input tensor.
+    # In quantized neural networks, the input tensor is quantized using a zero point that may be different from 0.
+    # Padding with the same zero point ensures that the padded areas aligns with the quantization scheme,
+    # Making the convolution operation more consistent across the entire input tensor.
     # It is handled here separately for greater control
     input_x = torch.nn.functional.pad(input_x, padding, 'constant', value=input_zero_point)
 
     # Step 2: calculate integer-based 2d convolution (8-bit multiplication with 32-bit accumulation)
     if 'cpu' in input_x.device.type:
-        # use 32-b MAC for simplicity
-        # What should be done is 8 bit convolution, stored in 32-bit number
+        # use 32-b MAC for simplicity (What should be done is 8 bit convolution, stored in 32-bit number)
         # Torch doesn't natively support 8-bit integer (int8) convolution on the CPU. There are specialized
         # quantized modules for int8 operations (like torch.quantized.conv2d), but using regular conv2d
         # with int8 can lead to unsupported operations or inconsistent results.
@@ -588,10 +628,12 @@ def quantized_conv2d(
 
         output = output.round().to(torch.int32)
 
-    # Step 3: Add bias if present
-    if bias is not None:
+    # Step 3: Add shifted bias if present
+    if shifted_q_bias is not None:
         # Output tensor from a convolution is shaped as (batch_size, out_channels, height, width)
-        output = output + bias.view(1, -1, 1, 1)
+        bias_shape = [1] * output.dim()
+        bias_shape[1] = -1
+        output = output + shifted_q_bias.view(bias_shape)
 
     # Step 4: Scale the output
     weight_shape = [1] * output.dim()
@@ -610,67 +652,12 @@ def quantized_conv2d(
     return output
 
 
-@torch.no_grad()
-def quantize_model_weights(model, bit_width):
-    """
-
-    :param model:
-    :param bit_width:
-    :return:
-    """
-    for name, param in model.named_parameters():
-        if param.ndim > 1:
-            quantized_param, scale, zero_point = linear_quantize_symmetric_weight_per_output_channel(param, bit_width)
-            param.copy_(quantized_param)
-
-
-def plot_weight_distributions(model, bit_width=32, extra_title=''):
-    """
-
-    :param model:
-    :param bit_width:
-    :param extra_title:
-    :return:
-    """
-    # bins = (1 << bit_width) if bit_width <= 8 else 256
-    if bit_width <= 8:
-        q_min, q_max = get_quantize_range(bit_width)
-        bins = np.arange(q_min, q_max + 2)
-        align = 'left'
-    else:
-        bins = 256
-        align = 'mid'
-
-    fig, axes = plt.subplots(3, 3, figsize=(10, 6))
-    axes = axes.ravel()
-
-    plot_index = 0
-    for name, param in model.named_parameters():
-        if param.dim() > 1:
-            ax = axes[plot_index]
-            ax.hist(
-                param.detach().view(-1).cpu(), bins=bins, density=True, align=align, color='blue', alpha=0.5,
-                edgecolor='black' if bit_width <= 4 else None)
-
-            if bit_width <= 4:
-                q_min, q_max = get_quantize_range(bit_width)
-                ax.set_xticks(np.arange(start=q_min, stop=q_max + 1))
-
-            ax.set_xlabel(name)
-            ax.set_ylabel('density')
-            plot_index += 1
-
-    fig.suptitle(f'Histogram of Weights (bit_width={bit_width} bits) {extra_title}')
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.925)
-
-
-def fuse_conv_bn(conv_layer, bn_layer):
+def fuse_conv_bn_layers(conv_layer, bn_layer):
     """
     Fuses a BatchNorm2d layer into the preceding Conv2d layer.
 
     This operation merges the normalization BN layer into the weights and biases of preceding Conv2D layer,
-    removing the need for a separate BatchNorm during inference.
+    removing the need for a separate BN during inference.
 
     Furthermore, BN introduces floating-point operations. By combining the 2 layers, the entire
     operation can be quantized at once, improving performance and reducing model size.
@@ -688,12 +675,6 @@ def fuse_conv_bn(conv_layer, bn_layer):
     The fused weights and bias are computed as:
         - `w' = w * gamma / sqrt(sigma^2 + eps)`
         - `b' = (b - mu) * gamma / sqrt(sigma^2 + eps) + beta`
-
-    **Benefits**:
-    - Simplifies inference by merging layers.
-    - Removes floating-point operations introduced by BN, making the model more efficient for quantization.
-    - Reduces the number of layers and operations, leading to faster execution on HW optimized
-      for low-precision computations (e.g., CPUs or accelerators).
 
     ** Reference **:
     Modified from: https://mmcv.readthedocs.io/en/latest/_modules/mmcv/cnn/utils/fuse_conv_bn.html
@@ -718,6 +699,9 @@ def fuse_conv_bn(conv_layer, bn_layer):
     return conv_layer
 
 
+# -------------------------------------------------------------------------------------------------
+# Activation min/max finding functions
+# -------------------------------------------------------------------------------------------------
 Range = namedtuple('Range', ['r_min', 'r_max'])
 
 
@@ -803,6 +787,9 @@ def add_range_recoder_hooks(model, x_range_store_dict, y_range_store_dict):
     return all_hooks
 
 
+# -------------------------------------------------------------------------------------------------
+# Quantization Layers
+# -------------------------------------------------------------------------------------------------
 class QuantizedConv2d(torch.nn.Module):
     def __init__(
             self, weight, bias, in_zp, out_zp, in_scale, w_scale, out_scale, stride, padding, dilation, groups,
@@ -833,7 +820,7 @@ class QuantizedConv2d(torch.nn.Module):
         #  PyTorch's current version does not support using IntTensor as nn.Parameter.
         # Since backpropagation is not needed, Store these values as buffers using register_buffer.
         # Buffers are tensors that do not require gradients and are not involved in backpropagation.
-        self.register_buffer('weight', weight)
+        self.register_buffer('weight', weight)  # quantized weight
         self.register_buffer('bias', bias)
 
         self.input_zero_point = in_zp
@@ -852,10 +839,21 @@ class QuantizedConv2d(torch.nn.Module):
         self.weight_bit_width = weight_bit_width
 
     def forward(self, x):
-        return quantized_conv2d(
-            x, self.weight, self.bias, self.feature_bit_width, self.weight_bit_width, self.input_zero_point,
-            self.output_zero_point, self.input_scale, self.weight_scale, self.output_scale, self.stride,
-            self.padding, self.dilation, self.groups
+        return quantized_conv2d_layer(
+            input_x=x,
+            weight=self.weight,
+            shifted_q_bias=self.bias,
+            feature_bit_width=self.feature_bit_width,
+            weight_bit_width=self.weight_bit_width,
+            input_zero_point=self.input_zero_point,
+            output_zero_point=self.output_zero_point,
+            input_scale=self.input_scale,
+            weight_scale=self.weight_scale,
+            output_scale=self.output_scale,
+            stride=self.stride,
+            padding=self.padding,
+            dilation=self.dilation,
+            groups=self.groups
         )
 
 
@@ -864,7 +862,7 @@ class QuantizedLinear(torch.nn.Module):
             self, weight, bias, input_zero_point, output_zero_point, input_scale, weight_scale, output_scale,
             feature_bit_width=8, weight_bit_width=8):
         """
-        A quantized linear (fully connected) layer. It stores the parameters needed for quantization
+        Create a quantized Linear Layer. It stores the parameters needed for quantization
         and calls the `quantized_linear_layer` function for computation.
 
         :param weight:
@@ -895,10 +893,15 @@ class QuantizedLinear(torch.nn.Module):
 
     def forward(self, x):
         return quantized_linear_layer(
-            x, self.weight, self.bias,
-            self.feature_bit_width, self.weight_bit_width,
-            self.input_zero_point, self.output_zero_point,
-            self.input_scale, self.weight_scale, self.output_scale
+            input_x=x,
+            weight=self.weight,
+            shifted_q_bias=self.bias,
+            feature_bit_width=self.feature_bit_width,
+            weight_bit_width=self.weight_bit_width,
+            input_zero_point=self.input_zero_point,
+            output_zero_point=self.output_zero_point,
+            input_scale=self.input_scale, weight_scale=self.weight_scale,
+            output_scale=self.output_scale
         )
 
 
@@ -926,10 +929,69 @@ class QuantizedAvgPool2d(torch.nn.AvgPool2d):
         return super().forward(x.float()).to(torch.int8)
 
 
+# -------------------------------------------------------------------------------------------------
+# Debugging functions
+# -------------------------------------------------------------------------------------------------
+def plot_weight_distributions(model, bit_width=32, extra_title=''):
+    """
+
+    :param model:
+    :param bit_width:
+    :param extra_title:
+    :return:
+    """
+    # bins = (1 << bit_width) if bit_width <= 8 else 256
+    if bit_width <= 8:
+        q_min, q_max = get_quantize_range(bit_width)
+        bins = np.arange(q_min, q_max + 2)
+        align = 'left'
+    else:
+        bins = 256
+        align = 'mid'
+
+    fig, axes = plt.subplots(3, 3, figsize=(10, 6))
+    axes = axes.ravel()
+
+    plot_index = 0
+    for name, param in model.named_parameters():
+        if param.dim() > 1:
+            ax = axes[plot_index]
+            ax.hist(
+                param.detach().view(-1).cpu(), bins=bins, density=True, align=align, color='blue', alpha=0.5,
+                edgecolor='black' if bit_width <= 4 else None)
+
+            if bit_width <= 4:
+                q_min, q_max = get_quantize_range(bit_width)
+                ax.set_xticks(np.arange(start=q_min, stop=q_max + 1))
+
+            ax.set_xlabel(name)
+            ax.set_ylabel('density')
+            plot_index += 1
+
+    fig.suptitle(f'Histogram of Weights (bit_width={bit_width} bits) {extra_title}')
+    fig.tight_layout()
+    fig.subplots_adjust(top=0.925)
+
+
+@torch.no_grad()
+def quantize_model_weights(model, bit_width):
+    """
+
+    :param model:
+    :param bit_width:
+    :return:
+    """
+    for name, param in model.named_parameters():
+        if param.ndim > 1:
+            quantized_param, scale, zero_point = linear_quantize_symmetric_weight_per_output_channel(param, bit_width)
+            param.copy_(quantized_param)
+
+
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
     torch.random.manual_seed(random_seed)
+    np.random.seed(random_seed)
 
     # Load Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -946,43 +1008,46 @@ if __name__ == "__main__":
     train_data_set, train_loader, test_data_set, test_loader, _ = (
         train_cifar10.get_cifar10_datasets_and_data_loaders(data_dir=data_dir, b_size=b_size))
 
-    # print(f"Floating point Model Accuracy {train_cifar10.evaluate(net, test_loader, device):0.2f}")
+    # print(f"Floating point model accuracy {train_cifar10.evaluate(net, test_loader, device):0.2f}")
 
     # # ---------------------------------------------------------------------------------------------
     # # Test Quantization Function
     # # ---------------------------------------------------------------------------------------------
-    # print("Test linear quantization function ...")
+    # print("Test linear quantization floating point tensor ...")
     # test_linear_quantize()
-
+    #
     # print("Test linear quantize Full connected layer ...")
     # test_quantized_fc()
 
+    # # TODO: Add function to test convolutional layer output
+
+    # # ---------------------------------------------------------------------------------------------
+    # # Quantize Model Weights
+    # # Note this modifies the models weights. Need to reload net after this
+    # # ---------------------------------------------------------------------------------------------
+    # print("Plotting weight distributions for different quantization levels")
+    # # Distribution of weights of the floating point model
+    # plot_weight_distributions(net, extra_title='Floating point model')
+    #
+    # # Quantize model weights and plot weight distributions
+    # quantized_bit_widths = [8, 4, 2]
+    #
+    # for q_bit_width in quantized_bit_widths:
+    #     quantize_model_weights(net, q_bit_width)
+    #
+    #     plot_weight_distributions(net, q_bit_width, extra_title="Quantized")
+    #
+    #     # quant_model_acc = train_cifar10.evaluate(net, test_loader, device)
+    #     # print(f"{q_bit_width}-bit quantized model accuracy (without fine-tuning) {quant_model_acc:0.2f}")
+    #
+    #     # Restore the model
+    #     net.load_state_dict(torch.load(saved_model_file, weights_only=True))
+
     # ---------------------------------------------------------------------------------------------
-    # Quantize Model Weights
+    # Optimization - Fuse Convolutional & BN layer for less inference compute
+    # Note: Commonly done in quantized networks - BN is just a scaling and a shifting operation
     # ---------------------------------------------------------------------------------------------
-    # Distribution of weights of the floating point model
-    plot_weight_distributions(net, extra_title='Floating point model')
-
-    # Quantize model weights and plot weight distributions
-    quantized_bit_widths = [ 8]
-
-    for q_bit_width in quantized_bit_widths:
-        quantize_model_weights(net, q_bit_width)
-
-        plot_weight_distributions(net, q_bit_width, extra_title="Quantized")
-
-        # quant_model_acc = train_cifar10.evaluate(net, test_loader, device)
-        # print(f"{q_bit_width}-bit quantized model accuracy (without fine-tuning) {quant_model_acc:0.2f}")
-
-        # Restore the model
-        net.load_state_dict(torch.load(saved_model_file, weights_only=True))
-
-    # ---------------------------------------------------------------------------------------------
-    # Fuse Convolutional & BN layer
-    # Commonly done in quantized networks - BN is just a scaling and a shifting operation
-    # For reducing the compute during interference it can be added as a multiplication and a bias
-    # ---------------------------------------------------------------------------------------------
-    print("Fusing BN and Convolutional layers for inference efficiency ...")
+    print("Fusing model conv and BN layers for inference efficiency ...")
 
     # Load original model
     net.load_state_dict(torch.load(saved_model_file, weights_only=True))
@@ -996,8 +1061,12 @@ if __name__ == "__main__":
     while ptr < len(model_fused.backbone):
         if isinstance(model_fused.backbone[ptr], torch.nn.Conv2d) and \
                 isinstance(model_fused.backbone[ptr + 1], torch.nn.BatchNorm2d):
-            fused_backbone.append(fuse_conv_bn(model_fused.backbone[ptr], model_fused.backbone[ptr + 1]))
+
+            fused_backbone.append(
+                fuse_conv_bn_layers(model_fused.backbone[ptr], model_fused.backbone[ptr + 1]))
+
             ptr += 2
+
         else:
             fused_backbone.append(model_fused.backbone[ptr])
             ptr += 1
@@ -1009,15 +1078,20 @@ if __name__ == "__main__":
     for m in model_fused.modules():
         assert not isinstance(m, torch.nn.BatchNorm2d)
 
+    print("conv BN fused model")
+    print(model_fused)
+
     # Accuracy should remain the same after fusion
     fused_acc = train_cifar10.evaluate(model_fused, test_loader, device)
-    print(f'Accuracy of the fused model={fused_acc:.2f}%')
+    print(f'Accuracy of the fused model = {fused_acc:.2f}%')
 
     # ---------------------------------------------------------------------------------------------
     # Find r_min/r_max of for input and outputs quantization
+    # Add forward hooks to store peak input/output r_max and r_max for each network layer
     # ---------------------------------------------------------------------------------------------
     print("Finding input/output r_max & r_min for all network layers ...")
-    # add hook to record the min max value of the activation
+
+    # Add pytorch forward hook to record the min max value of the activation
     input_activation_ranges = {}
     output_activation_ranges = {}
 
@@ -1034,13 +1108,28 @@ if __name__ == "__main__":
         h.remove()
 
     # print min max values for each layer:
-    print("\tInput activation ranges")
-    for k, v in input_activation_ranges.items():
-        print(f"\t\tInput {k}: min {v.r_min:0.2f}, max = {v.r_max:0.2f}")
+    for l_idx, layer in enumerate(input_activation_ranges.keys()):
+        i_r_min, i_r_max = input_activation_ranges[layer]
+        o_r_min, o_r_max = output_activation_ranges[layer]
 
-    print("\tOutput activation ranges")
-    for k, v in output_activation_ranges.items():
-        print(f"\t\tOutput {k}: min {v.r_min:0.2f}, max = {v.r_max:0.2f}")
+        layer_type = ''
+        if 'backbone' in layer:
+            layer_type = type(model_fused.backbone[l_idx]).__name__
+        elif 'classifier' in layer:
+            layer_type = type(model_fused.classifier).__name__
+
+        print(
+            f"{layer:<12} ({layer_type:<12}): "
+            f"Input ({i_r_min:7.2f}, {i_r_max:7.2f}) "
+            f"Output ({o_r_min:7.2f}, {o_r_max:7.2f})")
+
+    # Note: The ReLU layer operates in-place, which is why its input range is between 0 and r_max instead of reflecting
+    # the output range from the BatchNorm and convolution layers.
+
+    # # Debug - check if Relu is in place
+    # for name_module1, module1 in model_fused.named_modules():
+    #     if isinstance(module1, torch.nn.ReLU):
+    #         print(f"{name_module1}: inplace={module1.inplace}")
 
     # ----------------------------------------------------------------------------------------
     # Convert a fp model to its quantized version for inference.
@@ -1052,8 +1141,11 @@ if __name__ == "__main__":
 
     quantized_backbone = []
 
+    # Create the quantized model,
+    # create quantization layers and store all parameter including all pre-computable parts
     ptr = 0
     while ptr < len(quantized_model.backbone):
+
         if (isinstance(quantized_model.backbone[ptr], torch.nn.Conv2d) and
                 isinstance(quantized_model.backbone[ptr + 1], torch.nn.ReLU)):
 
@@ -1063,43 +1155,43 @@ if __name__ == "__main__":
             relu = quantized_model.backbone[ptr + 1]
             relu_name = f'backbone.{ptr + 1}'
 
-            # # Get input scale and zero point scales
-            # if ptr == 0:
-            #     # The input to the model is also scaled. to range (-127,128)
-            #     i_scale = 1 / 2**-7
-            #     i_zp = 0
-            # else:
+            # Get all parameters needed to create the conv layer  ---------------------------------------
+
+            # Get input scale and zero point scales
             i_r_min, i_r_max = input_activation_ranges[conv_name]
             i_scale, i_zp = get_quantization_scale_and_zero_point(torch.tensor([i_r_min, i_r_max]), f_bit_width)
 
             # Get output scale and zero point
-            # Quantize the output after applying the ReLU activation on the Conv layer's output.
-            # This approach ensures that we only consider non-negative activations, which accurately
-            # reflects the values that will be fed into the subsequent layers.
-            # Quantize range is only spread over (0, r_max) which gives higher resolution to the values that
-            # matter. Also do not need to include the relu operation either.
+            # Note output quantization is done after the relu (not after the fused conv-BN).
+            # 3 advantages of this approach: (1) input fed into the next layer is between (0, r-max).
+            # There is no need to spread the quantization range over negative values as these are not used.
+            # (2) In the actual range, we can have greater resolution. (3) We can get rid of the relu op
+            # as it is included in the quantization process.
             o_r_min, o_r_max = output_activation_ranges[relu_name]
             o_scale, o_zp = get_quantization_scale_and_zero_point(torch.tensor([o_r_min, o_r_max]), f_bit_width)
 
-            # Symmetric Quantize Weights
-            quantized_w, scale_w, zp_w = (
-                linear_quantize_symmetric_weight_per_output_channel(conv.weight.data, w_bit_width))
+            # Get quantized weights
+            quantized_w, scale_w, zp_w = \
+                linear_quantize_symmetric_weight_per_output_channel(conv.weight.data, w_bit_width)
 
-            # Symmetric quantize bias
+            # Get quantized bias
             quantized_b, scale_b, zp_b = \
                 linear_quantize_symmetric_bias_per_output_channel(conv.bias.data, scale_w, i_scale)
 
-            # Shifted quantized bias - precompute of quantized conv operation
+            # compute shifted_q_bias
             shifted_quantized_b = shift_quantized_conv2d_bias(quantized_b, quantized_w, i_zp)
 
+            # Form the quantized convolutional layer  --------------------------------------------------
             quantized_conv = QuantizedConv2d(
                 quantized_w, shifted_quantized_b, i_zp, o_zp, i_scale, scale_w, o_scale,
                 conv.stride, conv.padding, conv.dilation, conv.groups,
                 feature_bit_width=f_bit_width, weight_bit_width=w_bit_width)
 
             quantized_backbone.append(quantized_conv)
+
             ptr += 2
 
+        # Handle Max pooling layers
         elif isinstance(quantized_model.backbone[ptr], torch.nn.MaxPool2d):
             quantized_backbone.append(QuantizedMaxPool2d(
                 kernel_size=quantized_model.backbone[ptr].kernel_size,
@@ -1107,6 +1199,7 @@ if __name__ == "__main__":
             ))
             ptr += 1
 
+        # Handle Average pooling layer
         elif isinstance(quantized_model.backbone[ptr], torch.nn.AvgPool2d):
             quantized_backbone.append(QuantizedAvgPool2d(
                 kernel_size=quantized_model.backbone[ptr].kernel_size,
@@ -1119,30 +1212,37 @@ if __name__ == "__main__":
 
     quantized_model.backbone = torch.nn.Sequential(*quantized_backbone)
 
-    # finally, quantized the classifier
+    # Handle the Classifier
     fc_name = 'classifier'
     fc = net.classifier
 
+    # input scale and zp
     i_fc_r_min, i_fc_r_max = input_activation_ranges[fc_name]
     i_fc_scale, i_fc_zp = get_quantization_scale_and_zero_point(torch.tensor([i_fc_r_min, i_fc_r_max]), f_bit_width)
 
+    # output scale and zp
     o_fc_r_min, o_fc_r_max = output_activation_ranges[fc_name]
     o_fc_scale, o_fc_zp = get_quantization_scale_and_zero_point(torch.tensor([o_fc_r_min, o_fc_r_max]), f_bit_width)
 
+    # quantize the weight
     quantized_fc_w, scale_fc_w, zp_fc_w = (
         linear_quantize_symmetric_weight_per_output_channel(fc.weight.data, w_bit_width))
 
+    # quantize the bias
     quantized_fc_b, scale_fc_b, zp_fc_b = \
         linear_quantize_symmetric_bias_per_output_channel(fc.bias.data, scale_fc_w, i_fc_scale)
 
+    # Get shifted_q_bias
     shifted_quantized_b = shift_quantized_linear_bias(quantized_fc_b, quantized_fc_w, i_fc_zp)
 
+    # Attach layer to model
     quantized_model.classifier = QuantizedLinear(
         quantized_fc_w, shifted_quantized_b,
         i_fc_zp, o_fc_zp, i_fc_scale, scale_fc_w, o_fc_scale,
         feature_bit_width=f_bit_width, weight_bit_width=w_bit_width)
 
     # print the model
+    print("Quantized Model")
     print(quantized_model)
 
     # ---------------------------------------------------------------------------------------------
@@ -1155,6 +1255,7 @@ if __name__ == "__main__":
         x = (x + 1) * 128 - 128
 
         return x.clamp(-128, 127).to(torch.int8)
+
 
     extra_preprocess = [quantize_model_inputs]
 
