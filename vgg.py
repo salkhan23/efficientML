@@ -37,9 +37,14 @@ class VGG(nn.Module):
                 add("bn", nn.BatchNorm2d(x))
                 add("relu", nn.ReLU(True))  # True = Inplace, No xtra mem allocated. replaces input.
                 in_channels = x
-        else:
-            # max pool
-            add("pool", nn.MaxPool2d(2))
+            else:
+                # max pool
+                add("pool", nn.MaxPool2d(2))
+
+        # add an average pooling layer
+        # Before average pooling [N, 3, 32, 32] --> [N, 512, 2, 2]
+        # after average pooling [N, 512, 2, 2] --> [N, 512, 1, 1]
+        add("avgpool", nn.AvgPool2d(2))
 
         # nn.Sequential can take an OrderedDict to create a sequence of layers with specific names.
         #  This makes it easier to refer to and debug individual layers. For example, if you want
@@ -50,24 +55,10 @@ class VGG(nn.Module):
         self.classifier = nn.Linear(512, 10)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # backbone: [N, 3, 32, 32] => [N, 512, 2, 2]
-
+        # backbone: [N, 3, 32, 32] => [N, 512, 1, 1]
         x = self.backbone(x)
 
-        # Average pooling to reduce spatial dimensions
-        # Input shape: [N, 512, 2, 2]  --> Output shape: [N, 512]
-        # Handling quantized layers: torch.mean does not support int8 variables
-        original_dtype = x.dtype  # Store the original data type of x
-
-        # Calculate the mean based on the original data type
-        if original_dtype in [torch.int8]:
-            # For int8 or char types, calculate mean using integer arithmetic
-            x = x.sum(dim=[2, 3]) // (x.shape[2] * x.shape[3])  # Compute integer mean
-
-        else:
-            x = x.float().mean(dim=[2, 3])  # Compute floating-point mean
-
-        x = x.to(original_dtype)  # Convert the mean output back to the original data type
+        x = x.view(x.shape[0], -1)  # squeeze from 4D to 2D
 
         # classifier: [N, 512] => [N, 10]
         x = self.classifier(x)
