@@ -643,7 +643,7 @@ def quantized_conv2d_layer(
     output = output * input_scale * weight_scale / output_scale
 
     # Step 5: Shift output by output_zero_point
-    output = output + input_zero_point
+    output = output + output_zero_point
 
     # Step 6: Clamp values to the quantized range and convert to int8
     q_min, q_max = get_quantize_range(feature_bit_width)
