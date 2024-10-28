@@ -995,7 +995,7 @@ if __name__ == "__main__":
 
     # Load Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    saved_model_file = "../results_trained_models/07-06-2024_VGG_net_train_epochs_100_acc_81.pth"
+    saved_model_file = "../results_trained_models/27-10-2024_VGG_net_train_epochs_100_acc_93.pth"
 
     net = VGG()
 
