@@ -213,9 +213,6 @@ class OFAMCUNets(MCUNets):
                 max(self.depth_list) + self.base_depth[i] for i in range(5)
             ] + [1]  # This appends the number 1 as the last element of n_block_list.
 
-        import pdb
-        pdb.set_trace()
-
         # The widths of each block
         width_list = []
         for base_width in base_stage_width[2:-1]:
@@ -405,6 +402,7 @@ class OFAMCUNets(MCUNets):
     """ set, sample and get active sub-networks """
 
     def set_active_subnet(self, wid=None, ks=None, e=None, d=None, **kwargs):
+
         # add information to add a width multiplier
         # width_mult_id = val2list(wid, 3 + len(self.block_group_info))
         # print(' * Using a wid of ', wid)
