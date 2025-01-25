@@ -32,6 +32,10 @@ def torch_random_choices(src_list, generator, k=1):
 def set_bn_param(net, momentum, eps, gn_channel_per_group=None, ws_eps=None, **kwargs):
     replace_bn_with_gn(net, gn_channel_per_group)
 
+    # self.modules is a method of PyTorch's nn.Module class.
+    # It returns an iterator over all modules in the network, including:
+    #     All submodules (e.g., layers, blocks, etc.).
+    #     Submodules of submodules (recursively).
     for m in net.modules():
         if type(m) in [nn.BatchNorm1d, nn.BatchNorm2d]:
             m.momentum = momentum

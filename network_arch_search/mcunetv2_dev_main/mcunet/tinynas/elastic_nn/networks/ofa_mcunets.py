@@ -230,9 +230,21 @@ class OFAMCUNets(MCUNets):
             assert len(se_stages) == len(width_list)
 
         # for each stage
+        # Construct the intermediate stages of the network:
+        # For each stage, defined by its width, number of blocks, stride, and SE (Squeeze-and-Excitation) usage:
+        # 1. Append the block indices for the current stage to `self.block_group_info`.
+        # 2. For each block in the stage:
+        #    - Set the stride for the first block in the stage (`s`), and use stride 1 for subsequent blocks.
+        #    - Create a dynamic MobileNetV2-style inverted residual block (`DynamicMBConvLayer`):
+        #    - Add a shortcut connection (identity layer) if the stride is 1 and input/output channels match.
+        #    - Append the constructed block to the `blocks` list.
+        # 3. Update the input channels for the next block or stage.
         for width, n_block, s, use_se in zip(
             width_list, n_block_list, stride_stages, se_stages
         ):
+            # self.block_group_info is a list of lists that keeps track of the block indices for each
+            # stage in the network. Each sublist in self.block_group_info corresponds to a stage in the network and
+            # contains the indices of the blocks that belong to that stage.
             self.block_group_info.append([_block_index + i for i in range(n_block)])
             _block_index += n_block
 
@@ -306,6 +318,11 @@ class OFAMCUNets(MCUNets):
                     dropout_rate=dropout_rate,
                 )
 
+        # Initialize the parent class (MCUNets) with the network components:
+        # - first_conv: The initial convolutional layer for input processing.
+        # - blocks: A list of MobileInvertedResidualBlock layers for intermediate feature extraction.
+        # - feature_mix_layer: An optional 1x1 convolutional layer for feature mixing before classification.
+        # - classifier: The final fully connected layer for output classification.
         super(OFAMCUNets, self).__init__(
             first_conv, blocks, feature_mix_layer, classifier
         )
@@ -403,7 +420,17 @@ class OFAMCUNets(MCUNets):
 
     def set_active_subnet(self, wid=None, ks=None, e=None, d=None, **kwargs):
 
-        # add information to add a width multiplier
+        # 1. Set the active width multiplier (`wid`) to scale the number of output channels for all layers.
+        #    - If `wid` is provided, use the corresponding value from `out_channel_list`.
+        #    - If `wid` is None, use the maximum value from `out_channel_list`.
+        #    - Note: Adjusting output channels here requires the input channels of the next layer to be updated.
+        #      This is handled dynamically in the forward pass of each layer.
+        #    -  In the forward pass:
+        #    - The inverted bottleneck layer dynamically adjusts its output channels based on the input channels
+        #      and expansion ratio.
+        #    - The depthwise convolution adjusts its kernel size.
+        #    - The point wise convolution adjusts its output channels to match `.active_out_channel`.
+
         # width_mult_id = val2list(wid, 3 + len(self.block_group_info))
         # print(' * Using a wid of ', wid)
         for m in self.modules():
@@ -424,8 +451,16 @@ class OFAMCUNets(MCUNets):
         # for b in self.blocks:
         #     set_output_channel(b.mobile_inverted_conv)
 
+        # 2. Adjust kernel size and expansion ration
+        # ks: Kernel sizes for the convolutional layers in each block.
+        # e: Expansion ratios for the inverted residual blocks.
+        # Why -1? Because the first block in the network is treated differently:
+        # The first block is typically a fixed block (e.g., the first conv layer or the first inverted residual block).
+        # It does not participate in the dynamic configuration of kernel sizes or expansion ratios.
+        # ks and expand_ratio are applied only to the remaining blocks (i.e., self.blocks[1:]).
         ks = val2list(ks, len(self.blocks) - 1)
         expand_ratio = val2list(e, len(self.blocks) - 1)
+
         depth = val2list(d, len(self.block_group_info))
 
         for block, k, e in zip(self.blocks[1:], ks, expand_ratio):
@@ -433,6 +468,9 @@ class OFAMCUNets(MCUNets):
                 block.mobile_inverted_conv.active_kernel_size = k
             if e is not None:
                 block.mobile_inverted_conv.active_expand_ratio = e
+
+        # 3. Adjust the depth (number of blocks) for each stage.
+        # Depth is treated differently. It is per stage vs per block
 
         for i, d in enumerate(depth):
             if d is not None:
@@ -460,16 +498,28 @@ class OFAMCUNets(MCUNets):
         self.__dict__["_widthMult_include_list"] = None
 
     def sample_active_subnet(self, sample_function=random.choice, image_size=None):
+        """
+        Sample from the  possible network settings and create a new config. Set the active config of the model to
+        this new configuration
+        :param sample_function:
+        :param image_size:
+        :return:
+        """
+        # Allowed kernel sizes (self.ks_list)
         ks_candidates = (
             self.ks_list
             if self.__dict__.get("_ks_include_list", None) is None
             else self.__dict__["_ks_include_list"]
         )
+
+        # Expansion ratios for inverted bottleneck layers
         expand_candidates = (
             self.expand_ratio_list
             if self.__dict__.get("_expand_include_list", None) is None
             else self.__dict__["_expand_include_list"]
         )
+
+        # Depth ratio for different stages of the network.
         depth_candidates = (
             self.depth_list
             if self.__dict__.get("_depth_include_list", None) is None
@@ -480,6 +530,10 @@ class OFAMCUNets(MCUNets):
         ks_setting = []
         if not isinstance(ks_candidates[0], list):
             ks_candidates = [ks_candidates for _ in range(len(self.blocks) - 1)]
+            # Creates a list of lists for kernel size candidates for each block.
+            # self.blocks are defined in the parent block. They are initialized with the super call.
+            # They are the intermediate layers (first blocks, stages2, 3, 4, 5)
+
         for k_set in ks_candidates:
             k = sample_function(k_set)
             ks_setting.append(k)
@@ -517,6 +571,7 @@ class OFAMCUNets(MCUNets):
         }
         if image_size is not None:
             cfg.update(image_size=image_size)
+
         return cfg
 
     def get_active_subnet(self, preserve_weight=True):
