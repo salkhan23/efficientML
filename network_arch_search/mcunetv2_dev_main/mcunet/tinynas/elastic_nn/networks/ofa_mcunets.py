@@ -471,7 +471,6 @@ class OFAMCUNets(MCUNets):
 
         # 3. Adjust the depth (number of blocks) for each stage.
         # Depth is treated differently. It is per stage vs per block
-
         for i, d in enumerate(depth):
             if d is not None:
                 self.runtime_depth[i] = min(len(self.block_group_info[i]), d) + (
@@ -575,6 +574,39 @@ class OFAMCUNets(MCUNets):
         return cfg
 
     def get_active_subnet(self, preserve_weight=True):
+        """
+        Construct and return a new subnet based on the active configuration of the network.
+
+        This method creates a smaller version of the original network by selecting only the active
+        parameters (e.g., kernel sizes, expansion ratios, depths, and width multipliers) and
+        constructing a new instance of the network with these parameters. The original network
+        remains unchanged.
+
+        Parameters
+        ----------
+        preserve_weight : bool, optional
+            If True, the weights of the active subnet are copied from the original network.
+            If False, the subnet is created without copying weights (e.g., for initialization).
+            Defaults to True.
+
+        Returns
+        -------
+        MCUNets
+            A new instance of the network (`MCUNets`) configured with the active parameters.
+            This subnet is a smaller version of the original network, suitable for efficient
+            inference or architecture exploration.
+
+        Notes
+        -----
+        - The subnet is constructed using the active configuration of the original network,
+            including the active kernel sizes, expansion ratios, depths, and width multipliers.
+        - The original network is not modified; this method returns a separate instance.
+        - If `preserve_weight=True`, the subnet shares weights with the original network,
+            enabling efficient training and evaluation of multiple architectures.
+
+        :param preserve_weight:
+        :return:
+        """
         def get_or_copy_subnet(m, **kwargs):
             if hasattr(m, "get_active_subnet"):
                 out = m.get_active_subnet(preserve_weight=preserve_weight, **kwargs)

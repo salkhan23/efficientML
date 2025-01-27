@@ -17,6 +17,7 @@ from mcunet.tinynas.search.accuracy_predictor import AccuracyDataset, MCUNetArch
 from mcunet.tinynas.elastic_nn.networks.ofa_mcunets import OFAMCUNets
 from mcunet.utils.mcunet_eval_helper import calib_bn, validate
 from mcunet.utils.arch_visualization_helper import draw_arch
+from mcunet.utils.pytorch_utils import count_peak_activation_size, count_net_flops, count_parameters
 
 
 def build_val_data_loader(data_dir, resolution, batch_size=128, split=0):
@@ -64,7 +65,7 @@ def build_val_data_loader(data_dir, resolution, batch_size=128, split=0):
     val_dataset = datasets.ImageFolder(data_dir, transform=val_transform)
 
     # This selects a subset of indices from the dataset for the validation split.
-    # Even
+    # Even or Odd image sets.
     val_dataset = torch.utils.data.Subset(
         val_dataset, list(range(len(val_dataset)))[split::2]  # python slicing sequence [start:stop:step]
     )
@@ -73,6 +74,79 @@ def build_val_data_loader(data_dir, resolution, batch_size=128, split=0):
         val_dataset, batch_size=batch_size, shuffle=False, **kwargs
     )
     return val_loader
+
+
+def evaluate_sub_network(ofa_network1, cfg1, data_dir, image_size1=None):
+    """
+    Evaluates a subnetwork sampled from a larger once-for-all (OFA) network.
+
+    This function performs the following steps:
+    1. Samples the active subnet from the OFA network based on the provided configuration.
+    2. Extracts the subnet with corresponding weights from the OFA network.
+    3. Computes efficiency metrics for the subnet, including peak memory usage, multiply-accumulate operations (MACs),
+       and the number of parameters.
+    4. Recalibrates the Batch Normalization (BN) parameters of the subnet to align with its activation patterns
+       using a calibration dataset.
+    5. Defines a validation data loader based on the provided dataset directory and image size.
+    6. Evaluates the accuracy of the subnet using the validation dataset.
+
+    Args:
+        ofa_network1 (object): The once-for-all (OFA) network from which the subnet is sampled.
+        cfg1 (dict): Configuration for sampling the active subnet. Can include parameters like image size.
+        data_dir (str): Directory containing the dataset used for BN calibration and validation.
+        image_size1 (int, optional): The input image size. If not provided, it will be extracted from `cfg1`.
+
+    Returns:
+        tuple: A tuple containing the following metrics:
+            - acc1 (float): The accuracy of the subnet on the validation dataset.
+            - peak_memory (int): The peak activation memory usage of the subnet.
+            - macs (int): The number of multiply-accumulate operations (MACs) required by the subnet.
+            - params1 (int): The number of parameters in the subnet.
+    """
+
+    if "image_size" in cfg1:
+        image_size1 = cfg1["image_size"]
+
+    batch_size = 128
+
+    # step 1. sample the active subnet with the given config.
+    ofa_network1.set_active_subnet(**cfg1)
+
+    # step 2. extract the subnet with corresponding weights.
+    # Returns a new network with the dimensions (and weights) of the active subnet of the ofa_network
+    subnet = ofa_network1.get_active_subnet().to(device)
+
+    # step 3. calculate the efficiency stats of the subnet.
+    peak_memory = count_peak_activation_size(subnet, (1, 3, image_size1, image_size1))
+
+    macs = count_net_flops(subnet, (1, 3, image_size1, image_size1))
+
+    params1 = count_parameters(subnet)
+
+    # step 4. perform BN parameter re-calibration.
+    # BN calibration is necessary when evaluating subnets of a larger model because the BN layers in the full model
+    # store statistics (mean and variance) based on the full architecture, which may not align with the activation
+    # distributions of the smaller subnet. Without recalibration, the subnet may misnormalize activations,
+    # leading to incorrect outputs and degraded performance.
+    calib_bn(subnet, data_dir, batch_size, image_size1)
+
+    # step 5. define the validation dataloader.
+    val_loader = build_val_data_loader(data_dir, image_size1, batch_size)
+
+    # step 6. validate the accuracy.
+    acc1 = validate(subnet, val_loader)
+
+    return acc1, peak_memory, macs, params1
+
+
+def visualize_subnet(cfg1):
+    draw_arch(cfg1["ks"], cfg1["e"], cfg1["d"], cfg1["image_size"], out_name="viz/subnet")
+    im = Image.open("viz/subnet.png")
+    im = im.rotate(90, expand=1)
+    fig1 = plt.figure(figsize=(im.size[0] / 250, im.size[1] / 250))
+    plt.axis("off")
+    plt.imshow(im)
+    plt.show()
 
 
 if __name__ == "__main__":
@@ -127,10 +201,22 @@ if __name__ == "__main__":
     )
 
     ofa_network.load_state_dict(
-        torch.load("vww_supernet.pth", map_location="cpu")["state_dict"], strict=True
+        torch.load("vww_supernet.pth", map_location="cpu", weights_only=True)["state_dict"], strict=True,
     )
 
     ofa_network = ofa_network.to(device)
+
+    # ---------------------------------------------------------------------------------
+    # Sample Some Networks and visualize them
+    # ---------------------------------------------------------------------------------
+    image_size = 256
+
+    cfg = ofa_network.sample_active_subnet(sample_function=random.choice, image_size=image_size)
+
+    acc, _, _, params = evaluate_sub_network(ofa_network, cfg, data_dir=data_directory)
+
+    visualize_subnet(cfg)
+    print(f"The accuracy of the sampled subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
 
     import pdb
     pdb.set_trace()

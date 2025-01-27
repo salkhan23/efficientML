@@ -44,6 +44,7 @@ def build_val_data_loader(data_dir, resolution, batch_size=128, split=0):
 def calib_bn(net, data_dir, resolution, batch_size=128, num_images=2000):
     # print('Creating dataloader for resetting BN running statistics...')
     data_loader = build_val_data_loader(data_dir, resolution, batch_size, split=1)
+
     set_running_statistics(net, data_loader)
 
 
