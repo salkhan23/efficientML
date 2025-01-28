@@ -117,9 +117,9 @@ def evaluate_sub_network(ofa_network1, cfg1, data_dir, image_size1=None):
     subnet = ofa_network1.get_active_subnet().to(device)
 
     # step 3. calculate the efficiency stats of the subnet.
-    peak_memory = count_peak_activation_size(subnet, (1, 3, image_size1, image_size1))
+    peak_memory1 = count_peak_activation_size(subnet, (1, 3, image_size1, image_size1))
 
-    macs = count_net_flops(subnet, (1, 3, image_size1, image_size1))
+    macs1 = count_net_flops(subnet, (1, 3, image_size1, image_size1))
 
     params1 = count_parameters(subnet)
 
@@ -136,14 +136,14 @@ def evaluate_sub_network(ofa_network1, cfg1, data_dir, image_size1=None):
     # step 6. validate the accuracy.
     acc1 = validate(subnet, val_loader)
 
-    return acc1, peak_memory, macs, params1
+    return acc1, peak_memory1, macs1, params1
 
 
 def visualize_subnet(cfg1):
     draw_arch(cfg1["ks"], cfg1["e"], cfg1["d"], cfg1["image_size"], out_name="viz/subnet")
     im = Image.open("viz/subnet.png")
     im = im.rotate(90, expand=1)
-    fig1 = plt.figure(figsize=(im.size[0] / 250, im.size[1] / 250))
+    plt.figure(figsize=(im.size[0] / 250, im.size[1] / 250))
     plt.axis("off")
     plt.imshow(im)
     plt.show()
@@ -212,11 +212,19 @@ if __name__ == "__main__":
     image_size = 256
 
     cfg = ofa_network.sample_active_subnet(sample_function=random.choice, image_size=image_size)
-
     acc, _, _, params = evaluate_sub_network(ofa_network, cfg, data_dir=data_directory)
-
     visualize_subnet(cfg)
     print(f"The accuracy of the sampled subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
+
+    largest_cfg = ofa_network.sample_active_subnet(sample_function=max, image_size=image_size)
+    acc, _, _, params = evaluate_sub_network(ofa_network, largest_cfg, data_dir=data_directory)
+    visualize_subnet(largest_cfg)
+    print(f"The largest subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
+
+    smallest_cfg = ofa_network.sample_active_subnet(sample_function=min, image_size=image_size)
+    acc, peak_memory, macs, params = evaluate_sub_network(ofa_network, smallest_cfg, data_dir=data_directory)
+    visualize_subnet(smallest_cfg)
+    print(f"The smallest subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
 
     import pdb
     pdb.set_trace()
