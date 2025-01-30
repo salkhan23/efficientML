@@ -10,6 +10,15 @@ __all__ = ["MCUNetArchEncoder"]
 
 
 class MCUNetArchEncoder:
+    """
+    A class for encoding and decoding neural network architecture configurations into feature representations
+    and vice versa.
+
+    Represents a network architecture as a vector where each element corresponds to a specific choice
+    (like image size, width multiplier, kernel size for each block, etc.). Encoding would involve setting the
+    correct indices based on the chosen parameters, and decoding would involve reading the vector to get
+    back the parameters.
+    """
     def __init__(
         self,
         base_depth,
@@ -19,36 +28,61 @@ class MCUNetArchEncoder:
         expand_list=None,
         depth_list=None,
     ):
+        """
+        Initializes the MCUNetArchEncoder with architecture parameters and ranges.
+
+        :param base_depth: List of base depths for each stage of the network.
+        :param image_size_list: List of image resolutions supported. Defaults to [224].
+        :param width_mult_list: List of width multipliers for the network. Defaults to [1.0].
+        :param ks_list: List of kernel sizes to choose from. Defaults to [3, 5, 7].
+        :param expand_list: List of expand ratios for the network. Defaults to [3, 4, 6].
+        :param depth_list: List of possible depth values for each stage. Defaults to [0, 1, 2].
+        """
         self.base_depth = base_depth + [1]
+
         self.image_size_list = [224] if image_size_list is None else image_size_list
+
         self.width_mult_list = [1.0] if width_mult_list is None else width_mult_list
+
         self.ks_list = [3, 5, 7] if ks_list is None else ks_list
+
         self.expand_list = (
             [3, 4, 6]
             if expand_list is None
             else [int(expand) for expand in expand_list]
         )
         self.depth_list = [0, 1, 2] if depth_list is None else depth_list
+
         self.n_stage = 6
-        # divide between different stages
-        self.block_id_to_stage_id = [0 for _ in range(self.max_n_blocks)]
+
+        # This list maps each block ID to its corresponding stage ID.
+        self.block_id_to_stage_id = [0 for _ in range(self.max_n_blocks)]  # max_n_blocks is a property.
+
+        # This list records the starting block ID for each stage.
         self.stage_id_to_block_start = [0 for _ in range(len(self.base_depth))]
+
         num_blocks = 0
-        for stage_id, b_d in enumerate(self.base_depth):
+        for stage_id, b_d in enumerate(self.base_depth):  # list of base number of blocks per block
             self.stage_id_to_block_start[stage_id] = num_blocks
             # last stage must have depth 1
             if stage_id == len(self.base_depth) - 1:
                 cur_depth = b_d
             else:
                 cur_depth = b_d + max(self.depth_list)
+
             for block_id in range(num_blocks, num_blocks + cur_depth):
                 self.block_id_to_stage_id[block_id] = stage_id
+
             num_blocks += cur_depth
-        assert num_blocks == self.max_n_blocks
+
+        assert num_blocks == self.max_n_blocks  # max_n_blocks is a property
+
         # build info dict
-        self.n_dim = 0
-        self.r_info = dict(id2val={}, val2id={}, L=[], R=[])
+        self.n_dim = 0  # number of dimensions of the network architecture vector
+
+        self.r_info = dict(id2val={}, val2id={}, L=[], R=[])  # resolution
         self._build_info_dict(target="r")
+
         self.w_info = dict(id2val={}, val2id={}, L=[], R=[])
         self._build_info_dict(target="w")
 
@@ -57,45 +91,74 @@ class MCUNetArchEncoder:
         self._build_info_dict(target="k")
         self._build_info_dict(target="e")
 
+        # If the base depth is [1,2,2,2,2] and kernel size 7 is selected for all blocks,
+        # the encoding vector is computed as follows:
+        #     Resolution Encoding → [0]                 (224px → ID 0)
+        #     Width Multiplier Encoding → [0]           (1.0 → ID 0)
+        #     Kernel Size Encoding → [2, 2, ..., 2]     (length 9, since 7 → ID 2)
+        #     Expansion Ratio Encoding → [1, 1, ..., 1] (length 9, assuming expansion ratio 4 → ID 1)
+        #
+        #  9 = max_n_blocks
+        #
+        # Final Encoding Vector:
+        # [0,0,2,2,...,2,1,1,...,1](length: 20)
+
     @property
     def max_n_blocks(self):
+        # each stage has a min base # of blocks (base_depth[]). Each stage can be expanded by
+        # a value of upto self.depth_list
         # last stage must have depth 1
         return (self.n_stage - 1) * max(self.depth_list) + sum(self.base_depth)
 
     def _build_info_dict(self, target):
+
+        # image resolution
         if target == "r":
             target_dict = self.r_info
-            target_dict["L"].append(self.n_dim)
+            target_dict["L"].append(self.n_dim)  # left (lowest) index
+
             for img_size in self.image_size_list:
                 target_dict["val2id"][img_size] = self.n_dim
                 target_dict["id2val"][self.n_dim] = img_size
                 self.n_dim += 1
-            target_dict["R"].append(self.n_dim)
+
+            target_dict["R"].append(self.n_dim)  # right (most) index
+
         elif target == "w":
             target_dict = self.w_info
-            target_dict["L"].append(self.n_dim)
+            target_dict["L"].append(self.n_dim)  # note that n_dim is starting from the last value
+
             for width_mult in range(len(self.width_mult_list)):
                 target_dict["val2id"][width_mult] = self.n_dim
                 target_dict["id2val"][self.n_dim] = width_mult
                 self.n_dim += 1
+
             target_dict["R"].append(self.n_dim)
+
         else:
             if target == "k":
                 target_dict = self.k_info
                 choices = self.ks_list
+
             elif target == "e":
                 target_dict = self.e_info
                 choices = self.expand_list
+
             else:
                 raise NotImplementedError
+
             for i in range(self.max_n_blocks):
+
                 target_dict["val2id"].append({})
                 target_dict["id2val"].append({})
+
                 target_dict["L"].append(self.n_dim)
+
                 for k in choices:
                     target_dict["val2id"][i][k] = self.n_dim
                     target_dict["id2val"][i][self.n_dim] = k
                     self.n_dim += 1
+
                 target_dict["R"].append(self.n_dim)
 
     def arch2feature(self, arch_dict):
