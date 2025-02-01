@@ -149,6 +149,51 @@ def visualize_subnet(cfg1):
     plt.show()
 
 
+class AnalyticalEfficiencyPredictor:
+    """
+     Evaluates the efficiency of a given model by estimating:
+        - Peak Memory Utilization (in KB)
+        - Number of Multiply-Accumulate Operations (MACs)
+    """
+    def __init__(self, net):
+        self.net = net
+
+    def get_efficiency(self, spec: dict):
+        """
+        Computes efficiency metrics (MACs and Peak Activation Memory) for a given network specification.
+
+        :param spec: A dictionary containing model specifications, including 'image_size'
+        :return:A dictionary  containing Efficiency metrics including:
+            'millionMACs' : Total MACs divided by 1e6 (millions of MACs).
+            'KBPeakMemory': Peak memory usage in KB.
+        """
+        self.net.set_active_subnet(**spec)  # configure the OFA MCU Net with the sample network
+        subnet = self.net.get_active_subnet()  # create a new subnet from the active subnet of the OFA.
+
+        if torch.cuda.is_available():
+            subnet = subnet.cuda()
+
+        image_size1 = spec['image_size']
+        data_shape = (1, 3, image_size1, image_size1)
+        macs1 = count_net_flops(subnet, data_shape)
+
+        peak_memory1 = count_peak_activation_size(subnet, (1, 3, image_size1, image_size1))
+
+        return dict(millionMACs=macs1 / 1e6, KBPeakMemory=peak_memory1 / 1024)
+
+    @staticmethod
+    def satisfy_constraint(measured: dict, target: dict):
+        for key in measured:
+            # if the constraint is not specified, we just continue
+            if key not in target:
+                continue
+            # if we exceed the constraint, just return false.
+            if measured[key] > target[key]:
+                return False
+        # no constraint violated, return true.
+        return True
+
+
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
@@ -211,9 +256,10 @@ if __name__ == "__main__":
     ofa_network = ofa_network.to(device)
 
     # ---------------------------------------------------------------------------------
-    # Sample Some Networks and visualize them
+    # Sample some networks and visualize them
     # ---------------------------------------------------------------------------------
     image_size = 256
+    print(f"Getting accuracy's of sampled networks. Image Resolution {image_size}x{image_size}")
 
     sample_function = random.choice
     cfg = ofa_network.sample_active_subnet(sample_function, image_size=image_size)
@@ -233,7 +279,23 @@ if __name__ == "__main__":
     acc, peak_memory, macs, params = evaluate_sub_network(ofa_network, smallest_cfg, data_dir=data_directory)
     visualize_subnet(smallest_cfg)
     print(f"The {sample_function.__name__} subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
-    print(f"peak memory {peak_memory/1024:0.2f}KB, macs {macs/10e6:0.2f}M")
+    print(f"peak memory {peak_memory/1024:0.2f}KB, macs {macs/1e6:0.2f}M")
+
+    # Analytical Calculation of model efficiency (Peak activation memory & MACs)
+    # ---------------------------------------------------------------
+    efficiency_predictor = AnalyticalEfficiencyPredictor(ofa_network)
+
+    smallest_cfg = ofa_network.sample_active_subnet(sample_function=min, image_size=image_size)
+    eff_smallest = efficiency_predictor.get_efficiency(smallest_cfg)
+    print("Efficiency stats of the smallest subnet:", eff_smallest)
+
+    largest_cfg = ofa_network.sample_active_subnet(sample_function=max, image_size=image_size)
+    eff_largest = efficiency_predictor.get_efficiency(largest_cfg)
+    print("Efficiency stats of the largest subnet:", eff_largest)
+
+    # ---------------------------------------------------------------------------------
+    # Accuracy Prediction Network
+    # ---------------------------------------------------------------------------------
 
     import pdb
     pdb.set_trace()
