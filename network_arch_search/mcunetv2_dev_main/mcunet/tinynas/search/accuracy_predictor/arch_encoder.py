@@ -285,11 +285,15 @@ class MCUNetArchEncoder:
     def feature2arch(self, feature, verbose=False):
         feature_breakdown = []
 
+        # Feature vector section: [1, 0, 0]
+        #     np.argmax([1, 0, 0]) → 0
+        #     self.r_info["id2val"][0] might map to 224, so img_sz = 224.
         img_sz = self.r_info["id2val"][
             int(np.argmax(feature[self.r_info["L"][0]: self.r_info["R"][0]]))
             + self.r_info["L"][0]
         ]
         assert img_sz in self.image_size_list
+
         if verbose:
             print(
                 "image resolution embedding:",
@@ -325,13 +329,19 @@ class MCUNetArchEncoder:
 
         d = 0
         for i in range(self.max_n_blocks):
+
             stg = self.block_id_to_stage_id[i]
+
             if verbose and i == self.stage_id_to_block_start[stg]:
                 print("*" * 50 + f"Stage{stg + 1}" + "*" * 50)
 
             skip = True
             for j in range(self.k_info["L"][i], self.k_info["R"][i]):
+
+                # 1. extract the active feature
                 if feature[j] == 1:
+
+                    # Get the value from the index2Val dict
                     arch_dict["ks"].append(self.k_info["id2val"][i][j])
                     skip = False
                     if verbose:
