@@ -29,7 +29,7 @@ class AccuracyDataset:
     def __init__(self, path):
         self.path = path
         assert os.path.exists(self.path)
-        if not os.path.exists(self.acc_dict_path):
+        if not os.path.exists(self.acc_dict_path):  # property
             self.merge_acc_dataset()
 
     @property
@@ -43,7 +43,7 @@ class AccuracyDataset:
     def merge_acc_dataset(self):
         # load existing data
         merged_acc_dict = []
-        for fname in os.listdir(self.acc_src_folder):
+        for fname in os.listdir(self.acc_src_folder):  # property
             if ".json" not in fname:
                 continue
             full_path = os.path.join(self.acc_src_folder, fname)
@@ -58,33 +58,39 @@ class AccuracyDataset:
     ):
         # load data
         acc_dict = json.load(open(self.acc_dict_path))
-        X_all = []
-        Y_all = []
+
+        x_all = []
+        y_all = []
+
         with tqdm(total=len(acc_dict), desc="Loading data") as t:
             for (dic, v) in acc_dict:
-                X_all.append(arch_encoder.arch2feature(dic))
-                Y_all.append(v / 100.0)  # range: 0 - 1
+                x_all.append(arch_encoder.arch2feature(dic))
+                y_all.append(v / 100.0)  # range: 0 - 1
                 t.update()
-        base_acc = np.mean(Y_all)
+                # can manually update the tqdm progress bar in a loop by calling t.update(1)
+                # after each iteration, even when the total length is unknown.
+
+        base_acc = np.mean(y_all)
+
         # convert to torch tensor
-        X_all = torch.tensor(X_all, dtype=torch.float)
-        Y_all = torch.tensor(Y_all)
+        x_all = torch.tensor(x_all, dtype=torch.float)
+        y_all = torch.tensor(y_all)
 
         # random shuffle
-        shuffle_idx = torch.randperm(len(X_all))
-        X_all = X_all[shuffle_idx]
-        Y_all = Y_all[shuffle_idx]
+        shuffle_idx = torch.randperm(len(x_all))
+        x_all = x_all[shuffle_idx]
+        y_all = y_all[shuffle_idx]
 
         # split data
-        idx = X_all.size(0) // 5 * 4 if n_training_sample is None else n_training_sample
-        val_idx = X_all.size(0) // 5 * 4
-        X_train, Y_train = X_all[:idx], Y_all[:idx]
-        X_test, Y_test = X_all[val_idx:], Y_all[val_idx:]
-        print("Train Size: %d," % len(X_train), "Valid Size: %d" % len(X_test))
+        idx = x_all.size(0) // 5 * 4 if n_training_sample is None else n_training_sample
+        val_idx = x_all.size(0) // 5 * 4
+        x_train, y_train = x_all[:idx], y_all[:idx]
+        x_test, y_test = x_all[val_idx:], y_all[val_idx:]
+        print("Train Size: %d," % len(x_train), "Valid Size: %d" % len(x_test))
 
         # build data loader
-        train_dataset = RegDataset(X_train, Y_train)
-        val_dataset = RegDataset(X_test, Y_test)
+        train_dataset = RegDataset(x_train, y_train)
+        val_dataset = RegDataset(x_test, y_test)
 
         train_loader = torch.utils.data.DataLoader(
             train_dataset,

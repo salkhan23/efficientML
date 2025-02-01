@@ -194,6 +194,88 @@ class AnalyticalEfficiencyPredictor:
         return True
 
 
+class AccuracyPredictor(nn.Module):
+    """
+    A neural network module to predict the accuracy of OFA MCU net subnetworks.
+
+    The predictor takes a binary feature vector (obtained by encoding an architecture via an
+    MCUNetArchEncoder) and estimates its accuracy. The feature vector is processed through a
+    multilayer perceptron (MLP) with ReLU activations
+
+    The architecture for the predictor consists of:
+      - A configurable number of fully connected layers (n_layers) with hidden_size neurons.
+      - ReLU activation functions between layers.
+      - A final linear layer that outputs a single scalar value (the predicted accuracy).
+
+    """
+    def __init__(
+        self,
+        arch_encoder_net,
+        hidden_size=400,
+        n_layers=3,
+        checkpoint_path=None,
+        device1="cuda:0",
+    ):
+        """
+        Initializes the AccuracyPredictor.
+
+        :param arch_encoder_net: An instance of MCUNetArchEncoder used to encode architectures into feature vectors.
+        :param hidden_size: The number of neurons in each hidden layer of the MLP. Default is 400.
+        :param n_layers: The number of linear layers in the MLP. Default is 3. Note that the first layer's input\n
+            dimension is determined by arch_encoder_net.n_dim.
+        :param checkpoint_path: Path to a pretrained checkpoint to load weights from (if available).\n
+        :param device1: The device to use for computations (e.g., 'cuda:0' or 'cpu').\n
+        """
+        super(AccuracyPredictor, self).__init__()
+
+        self.arch_encoder = arch_encoder_net
+        self.hidden_size = hidden_size
+        self.n_layers = n_layers
+        self.device = device1
+
+        layers = []
+
+        # Each layer (nn.Linear) has hidden_size channels & uses nn.ReLU as the activation function.
+        # Use self.arch_encoder.n_dim to get the input dimension
+        for i in range(self.n_layers):
+            if i == 0:
+                layers.append(nn.Linear(arch_encoder_net.n_dim, self.hidden_size))
+                layers.append(nn.ReLU())
+            else:
+                layers.append(nn.Linear(self.hidden_size, self.hidden_size))
+                layers.append(nn.ReLU())
+
+        layers.append(nn.Linear(self.hidden_size, 1, bias=False))
+
+        self.layers = nn.Sequential(*layers)
+
+        self.base_acc = nn.Parameter(
+            torch.zeros(1, device=self.device), requires_grad=False
+        )
+
+        if checkpoint_path is not None and os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            if "state_dict" in checkpoint:
+                checkpoint = checkpoint["state_dict"]
+            self.load_state_dict(checkpoint)
+            print("Loaded checkpoint from %s" % checkpoint_path)
+
+        self.layers = self.layers.to(self.device)
+
+    def forward(self, x):
+        y = self.layers(x).squeeze()
+        return y + self.base_acc
+
+    def predict_acc(self, arch_dict_list):
+        # get feature as a feature vector
+        x = [self.arch_encoder.arch2feature(arch_dict) for arch_dict in arch_dict_list]
+
+        # convert to tensor
+        x = torch.tensor(np.array(x)).float().to(self.device)
+
+        return self.forward(x)
+
+
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
@@ -287,15 +369,153 @@ if __name__ == "__main__":
 
     smallest_cfg = ofa_network.sample_active_subnet(sample_function=min, image_size=image_size)
     eff_smallest = efficiency_predictor.get_efficiency(smallest_cfg)
-    print("Efficiency stats of the smallest subnet:", eff_smallest)
+    print(f"Efficiency stats of the smallest subnet: {eff_smallest}")
 
     largest_cfg = ofa_network.sample_active_subnet(sample_function=max, image_size=image_size)
     eff_largest = efficiency_predictor.get_efficiency(largest_cfg)
-    print("Efficiency stats of the largest subnet:", eff_largest)
+    print(f"Efficiency stats of the largest subnet: {eff_largest}")
 
     # ---------------------------------------------------------------------------------
     # Accuracy Prediction Network
     # ---------------------------------------------------------------------------------
+    image_size_list = [96, 112, 128, 144, 160]
+
+    # A Class that can OFA MCU Net architectures to compact feature vectors (required by the accuracy dataset)
+    arch_encoder = MCUNetArchEncoder(
+        image_size_list=image_size_list,
+        base_depth=ofa_network.base_depth,
+        depth_list=ofa_network.depth_list,
+        expand_list=ofa_network.expand_ratio_list,
+        width_mult_list=ofa_network.width_mult_list,
+    )
+
+    # Create accuracy predictor class
+    os.makedirs("pretrained", exist_ok=True)
+    acc_pred_checkpoint_path = (
+        f"pretrained/{ofa_network.__class__.__name__}_acc_predictor.pth"
+    )
+    print(f"Accuracy Predictor Model. Loading checkpoint {acc_pred_checkpoint_path}. "
+          f"Exists? {os.path.exists(acc_pred_checkpoint_path)}")
+
+    acc_predictor = AccuracyPredictor(
+        arch_encoder,
+        hidden_size=400,
+        n_layers=3,
+        checkpoint_path=None,
+        device1=device,
+    )
+    print(acc_predictor)
+
+    # Accuracy Dataset
+    print("Loading accuracy vs network arch feature map  dataset ...")
+    acc_dataset = AccuracyDataset("acc_datasets")
+
+    train_loader, valid_loader, base_acc = (
+        acc_dataset.build_acc_data_loader(arch_encoder=arch_encoder, batch_size=256))
+
+    print(f"The basic accuracy (mean accuracy of all subnets within the dataset is: {(base_acc * 100): .1f}%.")
+
+    # Sample some architecture feature vectors
+    sampled = 0
+    for (data, label) in train_loader:
+        data = data.to(device)
+        label = label.to(device)
+        print("=" * 100)
+        # dummy pass to print the divided encoding
+        arch_encoding = arch_encoder.feature2arch(data[0].int().cpu().numpy(), verbose=False)
+        # print out the architecture encoding process in detail
+        arch_encoding = arch_encoder.feature2arch(data[0].int().cpu().numpy(), verbose=True)
+        visualize_subnet(arch_encoding)
+        print(f"The accuracy of this subnet on the holdout validation set is: {(label[0] * 100): .1f}%.")
+        sampled += 1
+        if sampled == 1:
+            break
+
+    # ---------------------------------------------------------------------------------------
+    # Training th Accuracy Predictor Model
+    # ---------------------------------------------------------------------------------------
+    print("Training the accuracy predictor model ...")
+
+    criterion = torch.nn.L1Loss().to(device)
+    optimizer = torch.optim.Adam(acc_predictor.parameters())
+
+    # the default value is zero
+    acc_predictor.base_acc.data += base_acc
+
+    for epoch in tqdm(range(10)):
+        acc_predictor.train()
+        for (data, label) in tqdm(train_loader, desc="Epoch%d" % (epoch + 1), position=0, leave=True):
+
+            # step 1. Move the data and labels to device (cuda:0).
+            data = data.to(device)
+            label = label.to(device)
+
+            # # step 2. Run forward pass.
+            output = acc_predictor(data)  # output = [batch_size, 1]
+
+            # # step 3. Calculate the loss.
+            loss = criterion(output, label)
+
+            # # step 4. Perform the backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        acc_predictor.eval()
+        with torch.no_grad():
+            with tqdm(total=len(valid_loader), desc="Val", position=0, leave=True) as t:
+                for (data, label) in valid_loader:
+
+                    # step 1. Move the data and labels to device (cuda:0).
+                    data = data.to(device)
+                    label = label.to(device)
+
+                    # step 2. Run forward pass.
+                    output = acc_predictor(data)
+
+                    # step 3. Calculate the loss.
+                    loss = criterion(output, label)
+
+                    t.set_postfix({"loss": loss.item()})
+                    t.update(1)
+
+    if not os.path.exists(acc_pred_checkpoint_path):
+        torch.save(acc_predictor.cpu().state_dict(), acc_pred_checkpoint_path)
+
+    # plot the correlation of predicted accuracy against ground truth accuracy and make sure our predictor is reliable.
+    # -----------------------------------------------------------------------------------------------------------------
+    print("Checking the accuracy of the accuracy predictor with ground truth values")
+    predicted_accuracies = []
+    ground_truth_accuracies = []
+
+    acc_predictor = acc_predictor.to("cuda:0")
+    acc_predictor.eval()
+
+    with torch.no_grad():
+        with tqdm(total=len(valid_loader), desc="Val") as t:
+            for (data, label) in valid_loader:
+                data = data.to(device)
+                label = label.to(device)
+
+                pred = acc_predictor(data)
+                predicted_accuracies += pred.cpu().numpy().tolist()
+
+                ground_truth_accuracies += label.cpu().numpy().tolist()
+
+                if len(predicted_accuracies) > 200:
+                    break
+
+    plt.figure()
+    plt.scatter(predicted_accuracies, ground_truth_accuracies)
+    # draw y = x
+    min_acc, max_acc = min(predicted_accuracies), max(predicted_accuracies)
+
+    plt.plot([min_acc, max_acc], [min_acc, max_acc], c="red", linewidth=2, marker='+')
+
+    plt.xlabel("Predicted accuracy")
+    plt.ylabel("Measured accuracy")
+    plt.title("Correlation between predicted accuracy and real accuracy")
+
 
     import pdb
     pdb.set_trace()

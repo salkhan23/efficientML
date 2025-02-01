@@ -285,6 +285,7 @@ class MCUNetArchEncoder:
     def feature2arch(self, feature, verbose=False):
         feature_breakdown = []
 
+        # Input Resolution
         # Feature vector section: [1, 0, 0]
         #     np.argmax([1, 0, 0]) → 0
         #     self.r_info["id2val"][0] might map to 224, so img_sz = 224.
@@ -301,14 +302,17 @@ class MCUNetArchEncoder:
                 "=> image resolution:",
                 img_sz,
             )
+
         feature_breakdown += feature[self.r_info["L"][0]: self.r_info["R"][0]].tolist()
         feature_breakdown.append("|")
 
+        # Width multiplier
         width_mult = self.w_info["id2val"][
             int(np.argmax(feature[self.w_info["L"][0]: self.w_info["R"][0]]))
             + self.w_info["L"][0]
         ]
         assert width_mult in range(len(self.width_mult_list))
+
         if verbose:
             print(
                 "width multiplier embedding:",
@@ -316,6 +320,7 @@ class MCUNetArchEncoder:
                 "=> width multiplier:",
                 self.width_mult_list[width_mult],
             )
+
         feature_breakdown += feature[self.w_info["L"][0]: self.w_info["R"][0]].tolist()
         feature_breakdown.append("|")
 
@@ -327,23 +332,26 @@ class MCUNetArchEncoder:
             "wid": width_mult,
         }
 
-        d = 0
+        # Kernel Size & expansion ratios of each block
+        d = 0  # depth
         for i in range(self.max_n_blocks):
 
-            stg = self.block_id_to_stage_id[i]
+            stg = self.block_id_to_stage_id[i]  # get the stage of the current depth (block)
 
             if verbose and i == self.stage_id_to_block_start[stg]:
                 print("*" * 50 + f"Stage{stg + 1}" + "*" * 50)
 
             skip = True
+            # Extract the active feature values corresponding to the kernel size of the current block i
             for j in range(self.k_info["L"][i], self.k_info["R"][i]):
 
-                # 1. extract the active feature
+                # if this kernel size  between [L][i] and [R][i] is set
                 if feature[j] == 1:
-
-                    # Get the value from the index2Val dict
+                    # Get its actual value from the index2Val dict and append to the arch dict
                     arch_dict["ks"].append(self.k_info["id2val"][i][j])
-                    skip = False
+
+                    skip = False  # this block is active so do not skip.
+
                     if verbose:
                         print(
                             "kernel size embedding:",
@@ -352,13 +360,16 @@ class MCUNetArchEncoder:
                             self.k_info["id2val"][i][j],
                             end="; ",
                         )
+
                     feature_breakdown += feature[
                         self.k_info["L"][i]: self.k_info["R"][i]
                     ].tolist()
+
                     feature_breakdown.append("|")
 
                     break
 
+            # do the same for the expansion ratio.
             for j in range(self.e_info["L"][i], self.e_info["R"][i]):
                 if feature[j] == 1:
                     arch_dict["e"].append(self.e_info["id2val"][i][j])
@@ -377,6 +388,7 @@ class MCUNetArchEncoder:
                     feature_breakdown.append("|")
                     break
 
+            # if no 1 in the corrosponding places for this block, then skip the block
             if skip:
                 if verbose:
                     print(
@@ -386,25 +398,33 @@ class MCUNetArchEncoder:
                         feature[self.e_info["L"][i]: self.e_info["R"][i]],
                         "=> layer skipped.",
                     )
+
                 feature_breakdown += feature[
                     self.k_info["L"][i]: self.k_info["R"][i]
                 ].tolist()
+
                 feature_breakdown.append("|")
+
                 feature_breakdown += feature[
                     self.e_info["L"][i]: self.e_info["R"][i]
                 ].tolist()
+
                 feature_breakdown.append("|")
+
                 arch_dict["e"].append(0)
                 arch_dict["ks"].append(0)
+
             else:
                 d += 1
 
             if (i + 1) == self.max_n_blocks:
                 arch_dict["d"].append(self.base_depth[stg])
                 d = 0
+
             elif self.block_id_to_stage_id[i + 1] != stg:
                 arch_dict["d"].append(d - self.base_depth[stg])
                 d = 0
+
         if not verbose:
             print(
                 "network embedding:",
