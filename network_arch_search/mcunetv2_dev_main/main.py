@@ -160,6 +160,8 @@ if __name__ == "__main__":
 
     # -----------------------------------------------------------------------------------
     # Plot sample images from visual wake words dir
+    print("Plotting sample images from the visual wake woods dataset ...")
+
     val_data_loader = build_val_data_loader(data_directory, resolution=128, batch_size=1)
 
     vis_x, vis_y = 2, 3
@@ -186,6 +188,8 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------------------------
     # Create a Once-for-all network
     # -----------------------------------------------------------------------------------
+    print("Creating sample OFA MCU Networks ...")
+
     ofa_network = OFAMCUNets(
         n_classes=2,
         bn_param=(0.1, 1e-3),
@@ -211,20 +215,25 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------------
     image_size = 256
 
-    cfg = ofa_network.sample_active_subnet(sample_function=random.choice, image_size=image_size)
+    sample_function = random.choice
+    cfg = ofa_network.sample_active_subnet(sample_function, image_size=image_size)
     acc, _, _, params = evaluate_sub_network(ofa_network, cfg, data_dir=data_directory)
     visualize_subnet(cfg)
-    print(f"The accuracy of the sampled subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
+    print(f"The accuracy of the {sample_function.__name__} sampled subnet: "
+          f"#params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
 
-    largest_cfg = ofa_network.sample_active_subnet(sample_function=max, image_size=image_size)
+    sample_function = max
+    largest_cfg = ofa_network.sample_active_subnet(sample_function, image_size=image_size)
     acc, _, _, params = evaluate_sub_network(ofa_network, largest_cfg, data_dir=data_directory)
     visualize_subnet(largest_cfg)
-    print(f"The largest subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
+    print(f"The {sample_function.__name__} subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
 
-    smallest_cfg = ofa_network.sample_active_subnet(sample_function=min, image_size=image_size)
+    sample_function = min
+    smallest_cfg = ofa_network.sample_active_subnet(sample_function, image_size=image_size)
     acc, peak_memory, macs, params = evaluate_sub_network(ofa_network, smallest_cfg, data_dir=data_directory)
     visualize_subnet(smallest_cfg)
-    print(f"The smallest subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
+    print(f"The {sample_function.__name__} subnet: #params={params / 1e6: .1f}M, accuracy={acc: .1f}%.")
+    print(f"peak memory {peak_memory/1024:0.2f}KB, macs {macs/10e6:0.2f}M")
 
     import pdb
     pdb.set_trace()
