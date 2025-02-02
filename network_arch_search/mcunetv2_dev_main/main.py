@@ -267,19 +267,84 @@ class AccuracyPredictor(nn.Module):
         return y + self.base_acc
 
     def predict_acc(self, arch_dict_list):
-        # get feature as a feature vector
+        # get feature vectors for each arch dict in arch_dict_list
         x = [self.arch_encoder.arch2feature(arch_dict) for arch_dict in arch_dict_list]
 
-        # convert to tensor
+        # convert to tensor. THis creates a batch input. [num arch_dict, feature vectors]. THe way forward likes it.
         x = torch.tensor(np.array(x)).float().to(self.device)
 
         return self.forward(x)
+
+
+class RandomSearcher:
+    def __init__(self, efficiency_predictor1, accuracy_predictor):
+
+        self.efficiency_predictor = efficiency_predictor1
+        self.accuracy_predictor = accuracy_predictor
+
+    def random_valid_sample(self, constraint):
+        # randomly sample subnets until finding one that satisfies the constraint
+        while True:
+            # Dictionary of network architecture, sampled from max configs specified in arch_encoder
+            sample = self.accuracy_predictor.arch_encoder.random_sample_arch()
+
+            efficiency = self.efficiency_predictor.get_efficiency(sample)
+
+            if self.efficiency_predictor.satisfy_constraint(efficiency, constraint):
+                return sample, efficiency
+
+    def run_search(self, constraint, n_subnets=100):
+        subnet_pool = []
+
+        # sample subnets
+        for _ in tqdm(range(n_subnets)):
+            sample, efficiency = self.random_valid_sample(constraint)  # Returns dictionaries of architectures
+            subnet_pool.append(sample)
+
+        # predict the accuracy of subnets
+        accs = self.accuracy_predictor.predict_acc(subnet_pool)
+        # get the index of the best subnet
+        best_idx = torch.argmax(accs)
+
+        # return the best subnet
+        return accs[best_idx], subnet_pool[best_idx]
+
+
+def search_and_measure_acc(agent, constraint, data_dir, **kwargs):
+
+    n_subnets = kwargs.get("n_subnets", None)
+    if n_subnets is not None:
+        best_info = agent.run_search(constraint, n_subnets)
+    else:
+        best_info = agent.run_search(constraint)
+
+    # get searched subnet
+    ofa_network.set_active_subnet(**best_info[1])
+    subnet = ofa_network.get_active_subnet().to(device)
+
+    # calibrate bn
+    calib_bn(subnet, data_dir, best_info[1]["image_size"], 128)
+
+    # build val loader
+    val_loader = build_val_data_loader(data_dir, best_info[1]["image_size"], 128)
+
+    # measure accuracy
+    acc1 = validate(subnet, val_loader)
+
+    # print best_info
+    print(f"Accuracy of the selected subnet: {acc1}")
+
+    # visualize model architecture
+    visualize_subnet(best_info[1])
+
+    return acc1, subnet
 
 
 if __name__ == "__main__":
     plt.ion()
     random_seed = 10
     torch.random.manual_seed(random_seed)
+    np.random.seed(random_seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -516,6 +581,27 @@ if __name__ == "__main__":
     plt.ylabel("Measured accuracy")
     plt.title("Correlation between predicted accuracy and real accuracy")
 
+    # -------------------------------------------------------------------------------------
+    # NAS - Search
+    # -------------------------------------------------------------------------------------
+    print(f"Starting Random Search under constraints")
+    nas_agent = RandomSearcher(efficiency_predictor, acc_predictor)
+
+    # MACs-constrained search
+    subnets_rs_macs = {}
+    for millionMACs in [25, 100]:
+        search_constraint = dict(millionMACs=millionMACs)
+        print(f"Random search with constraint: MACs <= {millionMACs}M")
+        subnets_rs_macs[millionMACs] = search_and_measure_acc(
+            nas_agent, search_constraint, data_dir=data_directory, n_subnets=300)
+
+    # memory-constrained search
+    subnets_rs_memory = {}
+    for KBPeakMemory in [128, 512]:
+        search_constraint = dict(KBPeakMemory=KBPeakMemory)
+        print(f"Random search with constraint: Peak memory <= {KBPeakMemory}KB")
+        subnets_rs_memory[KBPeakMemory] = search_and_measure_acc(
+            nas_agent, search_constraint, data_dir=data_directory, n_subnets=300)
 
     import pdb
     pdb.set_trace()
