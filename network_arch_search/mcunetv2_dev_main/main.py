@@ -143,10 +143,12 @@ def visualize_subnet(cfg1):
     draw_arch(cfg1["ks"], cfg1["e"], cfg1["d"], cfg1["image_size"], out_name="viz/subnet")
     im = Image.open("viz/subnet.png")
     im = im.rotate(90, expand=1)
-    plt.figure(figsize=(im.size[0] / 250, im.size[1] / 250))
+    f = plt.figure(figsize=(im.size[0] / 250, im.size[1] / 250))
     plt.axis("off")
     plt.imshow(im)
     plt.show()
+
+    return f
 
 
 class AnalyticalEfficiencyPredictor:
@@ -337,7 +339,131 @@ def search_and_measure_acc(agent, constraint, data_dir, **kwargs):
     # visualize model architecture
     visualize_subnet(best_info[1])
 
-    return acc1, subnet
+    return acc1, subnet, best_info[1]
+
+
+class EvolutionSearcher:
+    def __init__(self, efficiency_predictor1, accuracy_predictor, **kwargs):
+        self.efficiency_predictor = efficiency_predictor1
+        self.accuracy_predictor = accuracy_predictor
+
+        # evolution hyper-parameters
+        self.arch_mutate_prob = kwargs.get("arch_mutate_prob", 0.1)
+        self.resolution_mutate_prob = kwargs.get("resolution_mutate_prob", 0.5)
+        self.population_size = kwargs.get("population_size", 100)
+        self.max_time_budget = kwargs.get("max_time_budget", 500)
+        self.parent_ratio = kwargs.get("parent_ratio", 0.25)
+        self.mutation_ratio = kwargs.get("mutation_ratio", 0.5)
+
+    def update_hyper_params(self, new_param_dict):
+        self.__dict__.update(new_param_dict)
+
+    def random_valid_sample(self, constraint):
+        # randomly sample subnets until finding one that satisfies the constraint
+        while True:
+            sample = self.accuracy_predictor.arch_encoder.random_sample_arch()
+            efficiency = self.efficiency_predictor.get_efficiency(sample)
+
+            if self.efficiency_predictor.satisfy_constraint(efficiency, constraint):
+                return sample, efficiency
+
+    def mutate_sample(self, sample, constraint):
+        while True:
+            new_sample = copy.deepcopy(sample)
+
+            self.accuracy_predictor.arch_encoder.mutate_resolution(new_sample, self.resolution_mutate_prob)
+            self.accuracy_predictor.arch_encoder.mutate_width(new_sample, self.arch_mutate_prob)
+            self.accuracy_predictor.arch_encoder.mutate_arch(new_sample, self.arch_mutate_prob)
+
+            efficiency = self.efficiency_predictor.get_efficiency(new_sample)
+
+            if self.efficiency_predictor.satisfy_constraint(efficiency, constraint):
+                return new_sample, efficiency
+
+    def crossover_sample(self, sample1, sample2, constraint):
+        while True:
+            new_sample = copy.deepcopy(sample1)
+
+            for key in new_sample.keys():
+                if not isinstance(new_sample[key], list):
+                    new_sample[key] = random.choice([sample1[key], sample2[key]])
+                else:
+                    for i in range(len(new_sample[key])):
+                        new_sample[key][i] = random.choice([ sample1[key][i], sample2[key][i]])
+
+            efficiency = self.efficiency_predictor.get_efficiency(new_sample)
+
+            if self.efficiency_predictor.satisfy_constraint(efficiency, constraint):
+                return new_sample, efficiency
+
+    def run_search(self, constraint, **kwargs):
+        self.update_hyper_params(kwargs)
+
+        mutation_numbers = int(round(self.mutation_ratio * self.population_size))
+        parents_size = int(round(self.parent_ratio * self.population_size))
+
+        best_valids = [-100]
+
+        population = []  # (acc, sample) tuples
+        child_pool = []
+        best_info = None
+
+        # generate random starting population
+        for _ in range(self.population_size):
+            sample, efficiency = self.random_valid_sample(constraint)
+            child_pool.append(sample)
+
+        # Get accuracies and make a list of (acc, arch_dict)
+        accs = self.accuracy_predictor.predict_acc(child_pool)
+        for i in range(self.population_size):
+            population.append((accs[i].item(), child_pool[i]))  # tuple (acc, child arch dict)
+
+        # evolving the population
+        with tqdm(total=self.max_time_budget) as t1:
+            for i in range(self.max_time_budget):
+                # Sort the population according to the acc (descending order)
+                population = sorted(population, key=lambda x: x[0], reverse=True)
+
+                # keep topK samples in the population, K = parents_size. The others are discarded.
+                population = population[0:parents_size]
+
+                # update best info
+                acc1 = population[0][0]
+                if acc1 > best_valids[-1]:
+                    best_valids.append(acc1)
+                    best_info = population[0]
+                else:
+                    best_valids.append(best_valids[-1])
+
+                # Process next generation
+                child_pool = []
+                for j in range(mutation_numbers):
+                    # randomly choose a sample
+                    par_sample = population[np.random.randint(parents_size)][1]
+                    # mutate this sample
+                    new_sample, efficiency = self.mutate_sample(par_sample, constraint)
+                    child_pool.append(new_sample)
+
+                for j in range(self.population_size - mutation_numbers):
+                    # randomly choose two samples
+                    par_sample1 = population[np.random.randint(parents_size)][1]
+                    par_sample2 = population[np.random.randint(parents_size)][1]
+                    # crossover
+                    new_sample, efficiency = self.crossover_sample(
+                        par_sample1, par_sample2, constraint
+                    )
+                    child_pool.append(new_sample)
+
+                # predict accuracy with the accuracy predictor
+                accs = self.accuracy_predictor.predict_acc(child_pool)
+
+                # Create next generation
+                for j in range(self.population_size):
+                    population.append((accs[j].item(), child_pool[j]))
+
+                t1.update(1)
+
+        return best_info
 
 
 if __name__ == "__main__":
@@ -580,28 +706,89 @@ if __name__ == "__main__":
     plt.xlabel("Predicted accuracy")
     plt.ylabel("Measured accuracy")
     plt.title("Correlation between predicted accuracy and real accuracy")
+    #
+    # # -------------------------------------------------------------------------------------
+    # # NAS - Search (Random)
+    # # -------------------------------------------------------------------------------------
+    # print(f"Starting Random Search under constraints")
+    # nas_agent = RandomSearcher(efficiency_predictor, acc_predictor)
+    #
+    # # MACs-constrained search
+    # subnets_rs_macs = {}
+    # for millionMACs in [25, 100]:
+    #     search_constraint = dict(millionMACs=millionMACs)
+    #     print(f"Random search with constraint: MACs <= {millionMACs}M")
+    #     subnets_rs_macs[millionMACs] = search_and_measure_acc(
+    #         nas_agent, search_constraint, data_dir=data_directory, n_subnets=300)
+    #
+    # # memory-constrained search
+    # subnets_rs_memory = {}
+    # for KBPeakMemory in [128, 512]:
+    #     search_constraint = dict(KBPeakMemory=KBPeakMemory)
+    #     print(f"Random search with constraint: Peak memory <= {KBPeakMemory}KB")
+    #     subnets_rs_memory[KBPeakMemory] = search_and_measure_acc(
+    #         nas_agent, search_constraint, data_dir=data_directory, n_subnets=300)
 
     # -------------------------------------------------------------------------------------
-    # NAS - Search
+    # NAS - Search (Evolutionary search)
     # -------------------------------------------------------------------------------------
-    print(f"Starting Random Search under constraints")
-    nas_agent = RandomSearcher(efficiency_predictor, acc_predictor)
+    print(f"Starting Evolutionary search under constraints ...")
 
-    # MACs-constrained search
-    subnets_rs_macs = {}
-    for millionMACs in [25, 100]:
-        search_constraint = dict(millionMACs=millionMACs)
-        print(f"Random search with constraint: MACs <= {millionMACs}M")
-        subnets_rs_macs[millionMACs] = search_and_measure_acc(
-            nas_agent, search_constraint, data_dir=data_directory, n_subnets=300)
+    evo_params = {
+        'arch_mutate_prob': 0.1,  # The probability of architecture mutation in evolutionary search
+        'resolution_mutate_prob': 0.1,  # The probability of resolution mutation in evolutionary search
+        'population_size': 100,  # The size of the population
+        'max_time_budget': 20,
+        'parent_ratio': 0.1,
+        'mutation_ratio': 0.1,
+    }
 
-    # memory-constrained search
-    subnets_rs_memory = {}
-    for KBPeakMemory in [128, 512]:
-        search_constraint = dict(KBPeakMemory=KBPeakMemory)
-        print(f"Random search with constraint: Peak memory <= {KBPeakMemory}KB")
-        subnets_rs_memory[KBPeakMemory] = search_and_measure_acc(
-            nas_agent, search_constraint, data_dir=data_directory, n_subnets=300)
+    nas_agent = EvolutionSearcher(efficiency_predictor, acc_predictor, **evo_params)
+
+    # # MACs-constrained search
+    # subnets_evo_macs = {}
+    # for millionMACs in [50, 100]:
+    #     search_constraint = dict(millionMACs=millionMACs)
+    #     print(f"Evolutionary search with constraint: MACs <= {millionMACs}M")
+    #     subnets_evo_macs[millionMACs] = search_and_measure_acc(nas_agent, search_constraint, data_dir=data_directory)
+    #
+    # # memory-constrained search
+    # subnets_evo_memory = {}
+    # for KBPeakMemory in [256, 512]:
+    #     search_constraint = dict(KBPeakMemory=KBPeakMemory)
+    #     print(f"Evolutionary search with constraint: Peak memory <= {KBPeakMemory}KB")
+    #     subnets_evo_memory[KBPeakMemory] = (
+    #         search_and_measure_acc(nas_agent, search_constraint,  data_dir=data_directory))
+
+    # MAC and Memory Constraint
+    # -----------------------------
+    evo_params = {
+        'arch_mutate_prob': 0.1,  # The probability of architecture mutation in evolutionary search
+        'resolution_mutate_prob': 0.1,  # The probability of resolution mutation in evolutionary search
+        'population_size': 100,  # The size of the population
+        'max_time_budget': 20,
+        'parent_ratio': 0.1,
+        'mutation_ratio': 0.1,
+    }
+
+    search_constraint = {
+        'millionMACs': 60,
+        'KBPeakMemory': 250
+    }
+    
+    string = (f"Evolutionary search with constraint:"
+              f" {', '.join(f'{key}: {value}' for key, value in search_constraint.items())}")
+    print(string)
+
+    constraint_net = search_and_measure_acc(nas_agent, search_constraint, data_dir=data_directory)
+
+    # Confirm network works
+    f = visualize_subnet(constraint_net[2])
+    f.suptitle(string)
+    acc = acc_predictor.predict_acc([constraint_net[2]])
+    eff_metrics = efficiency_predictor.get_efficiency(constraint_net[2])
+    print(f"Found Model with acc = {acc}, MACs = {eff_metrics['millionMACs']}M and peak Activation "
+          f"{eff_metrics['KBPeakMemory']}KB")
 
     import pdb
     pdb.set_trace()
