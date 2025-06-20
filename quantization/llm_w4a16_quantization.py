@@ -4,6 +4,7 @@ import inspect
 import tqdm
 import torch.nn as nn
 import datasets
+import gc
 
 Byte = 8
 KiB = 1024 * Byte
@@ -35,6 +36,82 @@ def get_model_size(model, data_width_bits=16, q_group_size=-1):
     size_bits = total_params * data_width_bits
 
     return size_bits
+
+
+# core quantization method (simulated quantization)
+def pseudo_quantize_tensor(w, n_bit=4, q_group_size=-1):
+    """
+    simulated quantization of a weight(must be 2D)
+
+    Uniform Quantization: Uniform quantization maps real-valued inputs in the range [β, α] to integer
+    values in the range [0, 2^b - 1], where b is the number of quantization bits.
+
+    Notation:
+        Quantized weight: w_q
+        Scale factor: s_q
+        Zero point: zp
+
+    (1) scale             = s_q = (α - β) / (2^b - 1)
+    (2) Zero point        = zp = - Round(β / s_q)
+    (3) quantized weights = w_q = Clamp(Round(w / s_q) + z)
+
+    :param w:
+    :param n_bit:
+    :param q_group_size:
+    :return:
+    """
+    org_w_shape = w.shape
+    if q_group_size > 0:
+        assert org_w_shape[-1] % q_group_size == 0  # ensure the last dimension is divisible by
+        # valid group quantization value
+
+    w = w.reshape(-1, q_group_size)  # reshape to [org_w_shape[0] * org_w_shape[1]/q_group_size, q_group_size]
+    assert w.dim() == 2
+
+    min_w, _ = w.min(dim=-1)
+
+    # now do groupwise quantization
+    # -----------------------------------------------------------------------------------
+    # Calculate the maximum (\alpha) and minimum values (\beta) in the tensor.
+    max_val = w.amax(dim=1, keepdim=True)
+    assert max_val.dim() == 2 and max_val.size(0) == w.size(0) and max_val.size(1) == 1
+
+    min_val = w.amin(dim=1, keepdim=True)
+    assert min_val.dim() == 2 and min_val.size(0) == w.size(0) and min_val.size(1) == 1
+
+    # scale and zero pint calculations
+    max_int = 2 ** n_bit - 1
+
+    scales = (max_val - min_val).clamp(min=1e-5) / max_int
+    assert scales.shape == max_val.shape
+
+    zeros = (-torch.round(min_val / scales)).clamp_(0, max_int)
+    assert scales.shape == min_val.shape
+
+    # Check for any Nan Values
+    assert torch.isnan(scales).sum() == 0
+    assert torch.isnan(w).sum() == 0
+
+    # Quantize W: Map values in the range [\beta, \alpha] to lie within [0, 2^b - 1] (Formula 3)
+    w = torch.clamp(torch.round(w / scales) + zeros, 0, max_int)
+    assert w.dim() == 2 and w.size(0) == scales.size(0) and w.size(1) == q_group_size
+
+    # De-quantize W (pseudo quantization, the inverse transformation of Formula 3)
+    w = (w - zeros) * scales
+    assert w.dim() == 2 and w.size(0) == scales.size(0) and w.size(1) == q_group_size
+
+    assert torch.isnan(w).sum() == 0
+
+    w = w.reshape(org_w_shape)
+    return w
+
+
+@torch.no_grad()
+def pseudo_quantize_model_weight(model, w_bit, q_group_size):
+
+    for n, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            m.weight.data = pseudo_quantize_tensor(m.weight.data, n_bit=w_bit, q_group_size=q_group_size)
 
 
 def evaluate(model, tokenizer):
@@ -95,8 +172,8 @@ def evaluate(model, tokenizer):
     # --------------------------------------------------------------------------------------------
     test_enc = test_enc.input_ids.to(model.device)  # test_enc is now only the message ids
 
-    n_batches = 80
-    seq_len = 1024
+    n_batches = 40
+    seq_len = 2048
     model = model.eval()
     total_tokens = 0  # total tokens counted
 
@@ -180,9 +257,27 @@ if __name__ == "__main__":
     print(f"Model: {net._get_name()}")
     print(f"Model Size {net_size_bits/MiB:0.2f} MB")
 
-    # evaluate the model
+    # # evaluate the model
     perplexity = evaluate(net, net_tokenizer)
     print(f"Model perplexity {perplexity:0.2f}")
+
+    # Quantize the model ---------------------------------------------------------------
+    # test_tensor = torch.rand(128, 128)
+    # pseudo_quantize_tensor(test_tensor, q_group_size=8)
+
+    del net
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+    pseudo_quantize_model_weight(net, w_bit=3, q_group_size=128)
+
+    # Evaluate the model
+    model_perplexity = evaluate(net, net_tokenizer)
+    model_size = get_model_size(net, data_width_bits=3, q_group_size=128)
+    print(f"\nQuantized Model")
+    print(f"\nmodel perplexity: {model_perplexity:.2f}")
+    print(f"quantized model size: {model_size / MiB:.2f} MiB")
 
     import pdb
     pdb.set_trace()
