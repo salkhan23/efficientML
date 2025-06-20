@@ -108,6 +108,13 @@ def pseudo_quantize_tensor(w, n_bit=4, q_group_size=-1):
 
 @torch.no_grad()
 def pseudo_quantize_model_weight(model, w_bit, q_group_size):
+    """
+    Quantize all linear layers  based on the provided quantization group size and number of bits of quantization
+    :param model:
+    :param w_bit:
+    :param q_group_size:
+    :return:
+    """
 
     for n, m in model.named_modules():
         if isinstance(m, nn.Linear):
@@ -254,14 +261,18 @@ if __name__ == "__main__":
 
     # Get model size  -----------------------------------------------------------------
     net_size_bits = get_model_size(net)
-    print(f"Model: {net._get_name()}")
-    print(f"Model Size {net_size_bits/MiB:0.2f} MB")
+    print(f"Original Model: {net._get_name()}")
 
-    # # evaluate the model
+    # Evaluate the model
     perplexity = evaluate(net, net_tokenizer)
     print(f"Model perplexity {perplexity:0.2f}")
+    print(f"Model Size {net_size_bits / MiB:0.2f} MB")
 
     # Quantize the model ---------------------------------------------------------------
+
+    # ----------------------------------------------------------------------------------
+    # Naive Weight quantization based on weight magnitudes only
+    # ----------------------------------------------------------------------------------
     # test_tensor = torch.rand(128, 128)
     # pseudo_quantize_tensor(test_tensor, q_group_size=8)
 
@@ -269,15 +280,15 @@ if __name__ == "__main__":
     gc.collect()
     torch.cuda.empty_cache()
 
+    print(f"\nWeight-magnitude based Quantized Model")
     net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
     pseudo_quantize_model_weight(net, w_bit=3, q_group_size=128)
 
     # Evaluate the model
     model_perplexity = evaluate(net, net_tokenizer)
     model_size = get_model_size(net, data_width_bits=3, q_group_size=128)
-    print(f"\nQuantized Model")
     print(f"\nmodel perplexity: {model_perplexity:.2f}")
-    print(f"quantized model size: {model_size / MiB:.2f} MiB")
+    print(f"Quantized model size: {model_size / MiB:.2f} MiB")
 
     import pdb
     pdb.set_trace()
