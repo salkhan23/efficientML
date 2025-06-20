@@ -11,7 +11,7 @@ MiB = 1024 * KiB
 GiB = 1024 * MiB
 
 
-def get_model_size(model, data_width_bits=16, quant_group_size=-1):
+def get_model_size(model, data_width_bits=16, q_group_size=-1):
     """
     Get Model Size in bits.
 
@@ -21,7 +21,7 @@ def get_model_size(model, data_width_bits=16, quant_group_size=-1):
 
     :param model:
     :param data_width_bits:
-    :param quant_group_size:
+    :param q_group_size:
     :return:
     """
     total_params = 0
@@ -29,8 +29,8 @@ def get_model_size(model, data_width_bits=16, quant_group_size=-1):
         total_params += param.numel()
 
     # Include per-bit contribution for using a scale and zero point
-    if quant_group_size != -1:
-        data_width_bits += (16 + 4) / quant_group_size
+    if q_group_size != -1:
+        data_width_bits += (16 + 4) / q_group_size
 
     size_bits = total_params * data_width_bits
 
@@ -95,52 +95,58 @@ def evaluate(model, tokenizer):
     # --------------------------------------------------------------------------------------------
     test_enc = test_enc.input_ids.to(model.device)  # test_enc is now only the message ids
 
-    n_batches = 40
-    batch_size = 1024
+    n_batches = 80
+    seq_len = 1024
     model = model.eval()
     total_tokens = 0  # total tokens counted
 
+    loss_fcn = nn.CrossEntropyLoss()
     nlls = []  # negative log likelihood for perplexity calculation
 
-    for i in tqdm.tqdm(range(n_batches), desc="evaluating..."):
+    for b_idx in tqdm.tqdm(range(n_batches), desc="evaluating..."):
 
-        batch = test_enc[:, (i * batch_size):((i + 1) * batch_size)].to(model.device)
+        batch = test_enc[:,  b_idx * seq_len: (b_idx+1) * seq_len]  # dim = [1, len(data)]
+
+        # Ensures the batch is at least two tokens long, which is the minimum
+        # needed to compute a next-token prediction.
+        if batch.shape[1] < 2:
+            continue
+
+        inputs = batch.to(model.device)
 
         with torch.no_grad():
-            output = model(batch)  # ordered dictionary with keys (logits, past_value keys)
+            output = model(inputs)
 
-        lm_logits = output.logits  # lm_logits dim = [batch, seq_len, embed_dim]
+        logits = output.logits  # [1m, batch_size, embed_dim]
 
-        # Drop the last logit (can't predict beyond the last input)
-        shift_logits = lm_logits[:, :-1, :].contiguous().float()
-        # contiguous aligns all memory into a contiguous block
-        # shift_logits dim = [batch, seq_len - 1, embed_dim] = [1, 1023, emb_dim]
+        # ---------------------------------------------------------------------------------
+        # calculate loss
+        # ----------------------------------------------------------------------------------
+        # Causal Language Model predict next token.
+        # There is no prediction for first token (needs to be removed from the labels) and
+        # there is no corresponding label for the last model output.
+        # TO align the two, both the labels and the logits need to be shifted (but differently)
 
-        # Drop the first label (because we can't compare it to any prediction)
-        shift_labels = test_enc[:, (i * batch_size): ((i + 1) * batch_size)]  # dim = [1,1024]
-        shift_labels = shift_labels[:, 1:]  # dim = [1,1023]
+        # shift the logits and labels to align
+        # Last logit needs to be ignored. No label for it
+        shifted_logits = logits[:, :-1, :]  # ignore the last output  [1, batch_size-1, embed_dim]
+        shifted_labels = inputs[:, 1:]      # ignore the first label  [1, batch_size-1, embed_dim]
 
-        # get rid of the batch dimension
-        shift_labels = shift_labels.view(-1)  # [1023, vocab_size]
-        shift_logits = torch.squeeze(shift_logits)  # [1023]
+        # reshape the outputs to be in a format expected by cross entropy
+        embed_dim = shifted_logits.shape[-1]
+        shifted_logits = shifted_logits.reshape(1 * (seq_len - 1), embed_dim)  # [seq_len, embed_dim]
+        shifted_labels = shifted_labels.reshape(1 * (seq_len - 1))  # [seq_len]
 
-        loss_fcn = nn.CrossEntropyLoss()
-        loss = loss_fcn(shift_logits, shift_labels)  # loss_fcn([1023, vocab_size], [1023]) = scalar [mean over batch]
+        loss = loss_fcn(shifted_logits, shifted_labels)
 
-        # -----------------------------------------------------------------------------------------
-        # Calculate Perplexity.
-        # -----------------------------------------------------------------------------------------
-        # Perplexity = exp(average negative log likelihood per token)
-
-        n_batch_tokens = shift_labels.numel()  # number of tokens in this batch (batch_size -1)
-        neg_log_likelihood = loss.item() * n_batch_tokens  # total loss for this batch (mean * count)
-
+        n_batch_tokens = shifted_labels.numel()
+        neg_log_likelihood = loss.item() * n_batch_tokens
         nlls.append(neg_log_likelihood)
         total_tokens += n_batch_tokens
 
     avg_neg_log_likelihood = sum(nlls) / total_tokens  # average loss per token over all batches
 
-    return avg_neg_log_likelihood
+    return torch.exp(torch.tensor(avg_neg_log_likelihood))  # perplexity
 
 
 if __name__ == "__main__":
@@ -153,29 +159,30 @@ if __name__ == "__main__":
     # device_map = "auto", tells transformer library how to deply the model on GPU/CPU, so it
     # fits & runs efficiently.
 
-    model_tokenizer = transformers.AutoTokenizer.from_pretrained(net_path, use_fast=False)
+    net_tokenizer = transformers.AutoTokenizer.from_pretrained(net_path, use_fast=False)
 
-    # debug visualize the model  -----------------------------------------------------------------
-    print(f"Model overall Structure: {'-'*50}")
-    print(net)
-    print(f"{'-' * 80}")
+    # # debug visualize the model  -----------------------------------------------------------------
+    # print(f"Model overall Structure: {'-'*50}")
+    # print(net)
+    # print(f"{'-' * 80}")
+    #
+    # print(f"Full Structure of model")
+    # for name, module in net.named_modules():
+    #     print(name)
+    # print(f"{'-' * 80}")
+    #
+    # print(f"Individual Code layer")
+    # print(inspect.getsource(net.model.decoder.layers[0].forward))
+    # # print(inspect.getsource(net.transformer.h[0].forward))
 
-    print(f"Full Structure of model")
-    for name, module in net.named_modules():
-        print(name)
-    print(f"{'-' * 80}")
-
-    import pdb
-    pdb.set_trace()
-
-    print(f"Individual Code layer")
-    print(inspect.getsource(net.model.decoder.layers[0].forward))
-    # print(inspect.getsource(net.transformer.h[0].forward))
-
-    # debug visualize the model  -----------------------------------------------------------------
+    # Get model size  -----------------------------------------------------------------
     net_size_bits = get_model_size(net)
     print(f"Model: {net._get_name()}")
     print(f"Model Size {net_size_bits/MiB:0.2f} MB")
+
+    # evaluate the model
+    perplexity = evaluate(net, net_tokenizer)
+    print(f"Model perplexity {perplexity:0.2f}")
 
     import pdb
     pdb.set_trace()
