@@ -348,11 +348,42 @@ def pseudo_quantize_model_salient_weight_fp16(model, n_bits, q_group_size, input
 
             # Quantize the entire weight tensor
             m.weight.data = pseudo_quantize_tensor(
-                m.weight.data, n_bit=n_bits, q_group_size=q_group_size
-            )
+                m.weight.data, n_bit=n_bits, q_group_size=q_group_size)
 
             # Step 2: Restore the 1% (or preserve_ratio) most important channels
             for idx, outlier_idx in enumerate(outlier_indices):
+                m.weight.data[:, outlier_idx].copy_(outlier[:, idx])
+
+
+@torch.no_grad()
+def pseudo_quantize_model_random_weight_fp16(model, n_bits, q_group_size, input_feat, preserve_ratio=0.01):
+    """
+
+    :param preserve_ratio:
+    :param model:
+    :param n_bits:
+    :param q_group_size:
+    :param input_feat:
+    :return:
+    """
+    for n, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            importance = sum(input_feat[n]).float()
+            n_dim = importance.shape[0]
+            n_preserve = max(int(n_dim * preserve_ratio), 1)
+
+            # Step 1: Randomly choose 1% of the weight channels
+            outlier_mask = torch.randint(0, n_dim, (n_preserve,))
+            assert outlier_mask.dim() == 1
+
+            # Back up the values of the selected weight channels
+            outlier = m.weight.data[:, outlier_mask].clone()
+
+            # Quantize the entire weight tensor
+            m.weight.data = pseudo_quantize_tensor(m.weight.data, n_bit=n_bits, q_group_size=q_group_size)
+
+            # Restore the preserved weights
+            for idx, outlier_idx in enumerate(outlier_mask):
                 m.weight.data[:, outlier_idx].copy_(outlier[:, idx])
 
 
@@ -494,8 +525,8 @@ if __name__ == "__main__":
     # print(inspect.getsource(net.model.decoder.layers[0].forward))
     # # print(inspect.getsource(net.transformer.h[0].forward))
 
-    # # Get model size  -----------------------------------------------------------------
-    print(f"Model: {net._get_name()}")
+    # # # Get model size  -----------------------------------------------------------------
+    # print(f"Model: {net._get_name()}")
 
     # Evaluate the model
     perplexity = evaluate(net, net_tokenizer)
@@ -503,7 +534,7 @@ if __name__ == "__main__":
     print(f"Perplexity {perplexity:0.2f}")
     print(f"Size {get_model_size(net) / MiB:0.2f} MB")
 
-    # Quantize the model ---------------------------------------------------------------
+    # # Quantize the model ---------------------------------------------------------------
 
     # ----------------------------------------------------------------------------------
     # Naive Weight quantization based on weight magnitudes only
@@ -537,11 +568,32 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
 
-    w_bit = 3
-    quantize_group_size = 128
+    w_bits = 3
+    quantized_group_size = 128
 
     input_features_stats = get_calib_features(net, net_tokenizer)
-    pseudo_quantize_model_salient_weight_fp16(net, w_bit, quantize_group_size, input_features_stats)
+    pseudo_quantize_model_salient_weight_fp16(net, w_bits, quantized_group_size, input_features_stats)
+
+    perplexity = evaluate(net, net_tokenizer)
+    net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
+    print(f"Perplexity {perplexity:0.2f}")
+    print(f"Size {net_size / MiB:0.2f} MB")
+
+    # ---------------------------------------------------------------------------------
+    # Activation Aware Quantization - preserving 1% of random weights
+    # ---------------------------------------------------------------------------------
+    print("\nActivation Aware Quantization - preserving full precision of random outliers")
+
+    del net
+    gc.collect()
+    torch.cuda.empty_cache()
+    net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+
+    w_bits = 3
+    quantized_group_size = 128
+
+    input_features_stats = get_calib_features(net, net_tokenizer)
+    pseudo_quantize_model_random_weight_fp16(net, w_bits, quantized_group_size, input_features_stats)
 
     perplexity = evaluate(net, net_tokenizer)
     net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
