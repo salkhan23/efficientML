@@ -387,6 +387,61 @@ def pseudo_quantize_model_random_weight_fp16(model, n_bits, q_group_size, input_
                 m.weight.data[:, outlier_idx].copy_(outlier[:, idx])
 
 
+@torch.no_grad()
+def pseudo_quantize_model_weight_scaleup(model, n_bit, q_group_size, input_feat, scale_factor, preserve_ratio=0.01):
+    """
+    Performs activation-aware quantization by scaling up important weight channels before quantization
+    and scaling them back down afterward. This method helps protect salient weights from large
+    quantization error while still using uniformly low bit-width quantization across all weights.
+
+    Unlike mixed-precision approaches (e.g., GPTQ), which store important weights in higher precision
+    (e.g., FP16) and quantize the rest, this technique preserves all weights in low bit-width (e.g., 4-bit)
+    form, enabling more aggressive compression without sacrificing critical accuracy.
+
+    The method:
+    - Identifies the most important input channels to each Linear layer using their activation statistics.
+    - Scales up these salient channels in the weight matrix by `scale_factor`.
+    - Applies uniform symmetric quantization to all weights.
+    - Scales down the salient channels post-quantization to preserve correct output behavior.
+
+    This preserves model accuracy better at low bit-widths by reducing the quantization error of
+    influential weights, without requiring changes to input activations or storing any weights in full precision.
+
+    Args:
+        model (torch.nn.Module): The model whose Linear layers will be quantized.
+        n_bit (int): Number of bits to use for weight quantization.
+        q_group_size (int): Number of weight channels per quantization group.
+        input_feat (dict): Dictionary mapping Linear layer names to lists of input activation
+                           magnitude tensors (used to determine importance).
+        scale_factor (float): Multiplicative factor to apply to important weight channels before quantization.
+        preserve_ratio (float, optional): Fraction of most important channels to scale/protect. Default is 0.01 (1%).
+
+    Returns:
+        None. The model is modified in-place.
+    """
+    for n, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            importance = sum(input_feat[n]).float()
+
+            # Step 1: Select most important channels based on input activation magnitude
+            n_dim = importance.shape[0]
+            n_preserve = max(int(n_dim * preserve_ratio), 1)
+            _, outlier_indices = torch.topk(importance, n_preserve)
+            assert outlier_indices.dim() == 1
+
+            # To simulate applying the scale factor, we can simply multiply it before quantization, and then
+            # divide by the scale factor after quantization.
+            # Scale up the values of the salient weight channels
+            # m.weight.data[:, outlier_mask] *= scale_factor
+            m.weight.data[:, outlier_indices] = m.weight.data[:, outlier_indices] * scale_factor
+
+            # Quantize
+            m.weight.data = pseudo_quantize_tensor(m.weight.data, n_bit=n_bit, q_group_size=q_group_size)
+
+            # Step 2: Scale back down the values of the salient weight channels
+            m.weight.data[:, outlier_indices] = m.weight.data[:, outlier_indices] / scale_factor
+
+
 def evaluate(model, tokenizer):
     """
     Evaluate a model over the wikitext (version: wikitext-2-raw-v1) test set and calculate its perplexity
@@ -525,8 +580,8 @@ if __name__ == "__main__":
     # print(inspect.getsource(net.model.decoder.layers[0].forward))
     # # print(inspect.getsource(net.transformer.h[0].forward))
 
-    # # # Get model size  -----------------------------------------------------------------
-    # print(f"Model: {net._get_name()}")
+    # # Get model size  -----------------------------------------------------------------
+    print(f"Model: {net._get_name()}")
 
     # Evaluate the model
     perplexity = evaluate(net, net_tokenizer)
@@ -534,7 +589,7 @@ if __name__ == "__main__":
     print(f"Perplexity {perplexity:0.2f}")
     print(f"Size {get_model_size(net) / MiB:0.2f} MB")
 
-    # # Quantize the model ---------------------------------------------------------------
+    # Quantize the model ---------------------------------------------------------------
 
     # ----------------------------------------------------------------------------------
     # Naive Weight quantization based on weight magnitudes only
@@ -599,6 +654,44 @@ if __name__ == "__main__":
     net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
     print(f"Perplexity {perplexity:0.2f}")
     print(f"Size {net_size / MiB:0.2f} MB")
+
+    # ----------------------------------------------------------------------------------------
+    # Activation Aware Quantization - Scale up important weights, quantize and then scale down
+    # ----------------------------------------------------------------------------------------
+    print("\nActivation Aware Quantization - Scale Up, Quantize & scale down weights")
+
+    del net
+    gc.collect()
+    torch.cuda.empty_cache()
+    net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+
+    w_bits = 3
+    quantized_group_size = 128
+
+    input_features_stats = get_calib_features(net, net_tokenizer)
+    pseudo_quantize_model_weight_scaleup(net, w_bits, quantized_group_size, input_features_stats, scale_factor=2)
+
+    perplexity = evaluate(net, net_tokenizer)
+    net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
+    print(f"Perplexity {perplexity:0.2f}")
+    print(f"Size {net_size / MiB:0.2f} MB")
+
+    print("Effect of scaling factor in perplexity")
+    scaling_factors_arr = [1, 2, 3, 4]
+    perplexity_arr = []
+    for scaling_factor in scaling_factors_arr:
+
+        del net
+        gc.collect()
+        torch.cuda.empty_cache()
+        net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+        
+        pseudo_quantize_model_weight_scaleup(net, w_bits, quantized_group_size, input_features_stats, scaling_factor)
+        perplexity = evaluate(net, net_tokenizer)
+        perplexity_arr.append(perplexity)
+
+    for sf_idx in range(len(perplexity_arr)):
+        print(f"\t scaling factor {scaling_factors_arr[sf_idx]}: perplexity={perplexity_arr[sf_idx]:2f}")
 
     import pdb
     pdb.set_trace()
