@@ -220,7 +220,7 @@ def get_calibration_dataset(tokenizer=None, n_samples=256, block_size=512):
         cat_samples[:, i*block_size:(i+1)*block_size] for i in range(n_split)
     ]  # List length = n_split, each item shape = [1, block_size]
 
-    print(f"Size of calibration Dataset: List of {len(processed_tokenized_data)}. Each element of shape "
+    print(f"Size of calibration Dataset: List of {len(processed_tokenized_data)} Values. Each element of shape "
           f"{processed_tokenized_data[0].shape}")
 
     return processed_tokenized_data
@@ -260,7 +260,7 @@ def get_calib_features(model, tokenizer):
     def stat_input_max_hook(m, x, y, name1):
         # `m`: the layer (nn.Linear instance)
         # `x`: input to the layer, usually a tuple (we extract x[0],
-        #      inputs inside the layers can have multiple elements, attention masks, head masks etc)
+        #      inputs inside the layers can have multiple elements, attention masks, head masks etc.)
         # `y`: output from the layer
         # `name`: string identifier for the layer, passed via partial()
 
@@ -442,6 +442,308 @@ def pseudo_quantize_model_weight_scaleup(model, n_bit, q_group_size, input_feat,
             m.weight.data[:, outlier_indices] = m.weight.data[:, outlier_indices] / scale_factor
 
 
+@torch.no_grad()
+def scale_ln_fcs(ln, fcs, scales):
+    """
+    Absorb activation-aware quantization scales into LayerNorm and Linear layers.
+
+    This function implements an efficient form of activation-aware quantization by:
+    - Pre-dividing LayerNorm weights and bias by the scales (effectively scaling down activations),
+    - Compensating by multiplying the Linear layer weights by the same scales (scaling up weights),
+    so that the usual quantize - dequantize steps are folded into existing network operations.
+
+    This blending: Eliminates explicit scaling steps during inference,
+
+    Args:
+        ln (torch.nn.LayerNorm): LayerNorm module to rescale.
+        fcs (torch.nn.Linear or list of torch.nn.Linear): One or more Linear layers sharing input features.
+        scales (torch.Tensor): 1D tensor of scale factors per normalized feature.
+
+    Why multiple Linear layers share the same scale:
+    - They operate on the same normalized activations,
+    - So a single scale vector suffices for consistent rescaling.
+    """
+    # Ensure fully connected layers (fcs) is a list for uniform processing
+    if not isinstance(fcs, list):
+        fcs = [fcs]
+
+    # Move scales to the same device as LayerNorm parameters
+    scales = scales.to(ln.weight.device)
+
+    # Scale down LayerNorm (ln) weights and biases by dividing by scales
+    ln.weight.div_(scales)  # in-place divide
+    if hasattr(ln, 'bias') and ln.bias is not None:
+        ln.bias.div_(scales)
+
+    # Scale up Linear weights by multiplying by scales to compensate
+    for fc in fcs:
+        fc.weight.mul_(scales.view(1, -1))  # scales = [1, channel_in], weight = [channel_out, channel_in]
+
+    # Sanity checks for NaNs after scaling
+    for p in ln.parameters():
+        assert torch.isnan(p).sum() == 0
+    for fc in fcs:
+        for p in fc.parameters():
+            assert torch.isnan(p).sum() == 0
+
+
+@torch.no_grad()
+def scale_fc_fc(fc1, fc2, scales):
+    """
+    Efficiently folds activation-aware quantization scales into two connected Linear layers.
+
+    PyTorch Linear weights have shape [out_features, in_features],
+    with the first dimension as output channels.
+
+    This function rescales:
+    - The last N output channels of `fc1` (weights and bias),
+    - The corresponding input channels of `fc2` (weights),
+
+    where N = scales.size(0) is the number of channels being scaled.
+
+    Notes on bias scaling:
+    - The bias in `fc1` is scaled down along with its weights to keep its relative impact balanced;
+      otherwise, the bias would become disproportionately large compared to scaled weights.
+    - `fc2` weights are scaled up to compensate for the scaled-down outputs of `fc1`.
+    - Biases in `fc2` are not scaled because scaling up the weights also scales the effect
+      of the scaled-down bias from `fc1`. Since biases are added after multiplication,
+      their relative effect remains correctly balanced without explicit scaling.
+
+    Args:
+        fc1 (torch.nn.Linear): First Linear layer producing activations.
+        fc2 (torch.nn.Linear): Second Linear layer consuming those activations.
+        scales (torch.Tensor): 1D tensor of scale factors for the last N output channels of `fc1`.
+
+    Returns:
+        None. Modifies the layers in-place.
+    """
+
+    assert isinstance(fc1, nn.Linear)
+    assert isinstance(fc2, nn.Linear)
+
+    scales = scales.to(fc1.weight.device)
+    n_ch_2_scale = scales.size(0)
+
+    # Scale down last N output channels of fc1 weights
+    fc1.weight[-n_ch_2_scale:, :].div_(scales.view(-1, 1))  # scales reshaped to [N, 1] for broadcasting
+
+    # Scale down corresponding bias terms of fc1 to keep balanced impact
+    if fc1.bias is not None:
+        fc1.bias[-n_ch_2_scale:].div_(scales)  # scales shape: [N]
+
+    # Scale up last N input channels (columns) of fc2 weights
+    # This compensates for the scaled-down output from fc1,
+    # and also scales up the effect of the scaled-down bias implicitly.
+    fc2.weight[:, -n_ch_2_scale:].mul_(scales.view(1, -1))  # [out_features, N] * [1, N]
+
+    # Bias in fc2 is NOT scaled
+
+    # Sanity checks to ensure no NaNs after scaling
+    for p in fc1.parameters():
+        assert torch.isnan(p).sum() == 0
+    for p in fc2.parameters():
+        assert torch.isnan(p).sum() == 0
+
+
+@torch.no_grad()
+def auto_scale_block(module, name, w_bit, q_group_size, input_feat):
+    """
+    Applies activation-aware scaling and quantization to a transformer block
+    (specifically, an OPTDecoderLayer-like module).
+
+    Steps:
+    1. For self-attention's Q, K, V projections: compute shared input-based scale,
+       fold into LayerNorm and Linear weights.
+    2. For v_proj → out_proj: fold scale into this pair of Linear layers.
+    3. For final LayerNorm → fc1: fold scale into LayerNorm and fc1.
+    4. For fc1 → fc2: fold scale into this MLP connection.
+
+    Args:
+        module (nn.Module) : The transformer block to process (e.g., one encoder layer).
+        name (str)         : Name prefix used to locate corresponding input activations in `input_feat`.
+        w_bit (int)        : Number of bits to use for quantizing weights.
+        q_group_size (int) : Number of output channels per quantization group.
+        input_feat (dict[str, List[Tensor]]): Dictionary mapping layer names to lists of
+           input activation tensors collected during a forward pass.
+
+    Returns:
+        None. The function modifies the module's weights in-place to embed scaling.
+    :param module:
+    :param name:
+    :param w_bit:
+    :param q_group_size:
+    :param input_feat:
+    :return:
+    """
+    def _search_module_scale(block, linears_to_scale, x, kwargs={}):
+        """
+        Find the exponent r* in [0,1] that minimizes the expected squared error:
+
+        r* = argmin_{r} E[ || block(x) - block_quantized(x; scales = s_x^r) ||^2 ]
+
+        where:
+            - E[...] denotes the expected value over the input distribution,
+            - block(x) is the original module output,
+            - block_quantized(x; scales) is the output after scaling weights by scales, quantizing, and rescaling,
+            - s_x is the given per-channel scale vector.
+
+        Args:
+            block (nn.Module): A module like self_attn or fc1/fc2 to forward with scaled weights.
+            linears_to_scale (list of nn.Linear): Linear layers whose weights are scaled.
+            x (Tensor)       : Calibration input features to feed into `block`.
+            kwargs (dict)    : Optional forward kwargs for `block`.
+
+        Returns:
+            best_scales (Tensor): 1D tensor of scale factors minimizing MSE after quantization.
+        """
+
+        # block.parameters is generator that iterates through learnable parameters. Calling next once,
+        # returns the first parameter.
+        device = next(block.parameters()).device
+        x = x.to(device)
+
+        # Original (float32) output. If the block returns multiple outputs (e.g. attention weights),
+        # keep only the first (output) values
+        with torch.no_grad():
+            original_output = block(x, **kwargs)
+            if isinstance(original_output, tuple):
+                original_output = original_output[0]
+
+        # x.view(-1, x.shape[-1]) flattens batch and sequence dimensions  (keep only the embed dim)
+        # .abs().mean(0) computes the avg activation magnitude per embedding dimension across all tokens
+        mean_abs_activation = x.view(-1, x.shape[-1]).abs().mean(0)  # shape: [embed_dim]
+
+        best_error = float("inf")
+        best_scales = mean_abs_activation  # starting scales
+        # Save a CPU copy of the block’s org. weights before scaling to preserve them.
+        # After each scaling iteration, restore these originals to avoid cumulative modifications.
+        original_state = {k: v.cpu() for k, v in block.state_dict().items()}
+
+        n_grid = 20  # Number of exponents to try for s = |x|^r
+
+        # print(f"Finding optimization scales for {block}")
+
+        for i in range(n_grid):
+            ratio = i / n_grid
+            scales = mean_abs_activation.pow(ratio)
+
+            # Clamp min scale to a small value so that divide by the norm does not give a NaN
+            epsilon = 1e-8
+            scales = torch.clamp(scales, min=epsilon)
+
+            # Normalize and clip
+            # Normalization prevents the scales from becoming arbitrarily large or small, which could
+            # distort weight values and make quantization error comparisons invalid. It ensures the
+            # optimization focuses on the relative scaling between channels.  Normalization by the
+            # geometric mean balances the scales multiplicatively, centering them between their min and
+            # max values to handle wide dynamic ranges effectively. However, normalization does not remove
+            # extreme outliers, so clipping is applied to restrict scales
+            norm = torch.sqrt(scales.max() * scales.min())
+            scales = torch.clamp(scales / norm, min=1e-4, max=1e4)
+
+            # print(f"{i}: Ratio {ratio}, scale max {scales.max()}, min {scales.min()}. "
+            #       f"Any NaNs {torch.isnan(scales).any()}")
+
+            for fc in linears_to_scale:
+                scales = scales.to(fc.weight.device)
+
+                # Temporarily scale weight, quantize, then rescale back
+                # We are just interested in the scaling factor at the moment and this
+                # approach models the impact of including them. But it adds extra steps to the process
+                # later scales will be added more efficiently in an optimized way (scale_ln_fcs, scale_fc_fc)
+                fc.weight.mul_(scales)
+                fc.weight.data = pseudo_quantize_tensor(fc.weight.data, w_bit, q_group_size)
+                fc.weight.div_(scales)
+
+            # Forward with quantized weights
+            q_output = block(x, **kwargs)
+            if isinstance(q_output, tuple):
+                q_output = q_output[0]
+
+            # Measure quantization error
+            error = (original_output - q_output).float().pow(2).mean().item()
+            if error < best_error:
+                best_error = error
+                best_scales = scales.clone()
+
+            # Restore original state for next trial
+            block.load_state_dict(original_state)
+
+        assert torch.isnan(best_scales).sum() == 0, "NaNs in best scales"
+        return best_scales.detach()
+
+    # attention input
+    # ------------------------------------------------------------------------------------
+    # 1. Scale Q, K, V projections using common input from self_attn_layer_norm
+    #
+    # * Use the same scale for Q, K, and V? Q, K, and V are projections of the same input tensor,
+    # so a single per-channel scale vector can be shared across them.
+    #
+    # * The activations from the OUTPUT of the self attention block are used.  It’s used as a proxy
+    # because the true input to the Q/K/V projections wasn't explicitly saved during calibration.
+    # Ideally, scaling should be computed from the actual input to the Q/K/V layers for correctness.
+    # ------------------------------------------------------------------------------------
+    # print(f"Starting quantization of self attention layer Q,K,V weight matrices for {name} ")
+    qkv_input = input_feat[name + '.self_attn.out_proj']
+    qkv_input = torch.cat([x.unsqueeze(0) for x in qkv_input], dim=0).unsqueeze(0)
+
+    qkv_linears = [module.self_attn.q_proj, module.self_attn.k_proj, module.self_attn.v_proj]
+    qkv_scales = _search_module_scale(module.self_attn, qkv_linears, qkv_input)
+    # add optimal scales efficiently - Assume a pre-norm arch, layer norm, then projection layers
+    scale_ln_fcs(module.self_attn_layer_norm, qkv_linears, qkv_scales)
+
+    # ------------------------------------------------------------------------------------
+    # 2. Scale attention output projection (v_proj → out_proj)
+    # ------------------------------------------------------------------------------------
+    # print(f"Starting quantization of self attention output weight matrices for {name} ")
+    out_proj_input = input_feat[name + '.self_attn.out_proj']
+    out_proj_input = torch.cat([x.unsqueeze(0) for x in out_proj_input], dim=0)
+
+    out_proj_scales = _search_module_scale(
+        module.self_attn.out_proj, [module.self_attn.out_proj], out_proj_input)
+    # add output scales efficiently, div v_projection layer weights, multiply output projection layer weights
+    scale_fc_fc(module.self_attn.v_proj, module.self_attn.out_proj, out_proj_scales)
+
+    # ------------------------------------------------------------------------------------
+    # Step 3: Quantize MLP first layer (fc1), coming from final_layer_norm
+    # ------------------------------------------------------------------------------------
+    # print(f"Starting quantization of MLP FC1 layer for {name} ")
+    fc1_input = input_feat[name + '.fc1']
+    fc1_input = torch.cat([x.unsqueeze(0) for x in fc1_input], dim=0)
+    fc1_scales = _search_module_scale(module.fc1, [module.fc1], fc1_input)
+    # again assuming pre-norm config
+    scale_ln_fcs(module.final_layer_norm, module.fc1, fc1_scales)
+
+    # ------------------------------------------------------------------------------------
+    # Step 4: Quantize MLP second layer (fc2), which takes input from fc1
+    # ------------------------------------------------------------------------------------
+    # print(f"Starting quantization of MLP FC2 layer for {name} ")
+    fc2_input = input_feat[name + '.fc2']
+    fc2_input = torch.cat([x.unsqueeze(0) for x in fc2_input], dim=0)
+    fc2_scales = _search_module_scale(module.fc2, [module.fc2], fc2_input)
+    # notice the cascading on fc1. scaled up for its own optimal scale,
+    # then scaled down for the div of fc2 scales
+    scale_fc_fc(module.fc1, module.fc2, fc2_scales)
+
+
+@torch.no_grad()
+def pseudo_quantize_model_weight_auto_scale(
+    model, w_bit, q_group_size, input_feat
+):
+    from transformers.models.opt.modeling_opt import OPTDecoderLayer
+
+    # Scale the weights optimally
+    for name, module in model.named_modules():
+        print(f"{name} is OPTDECODERLayer {isinstance(module, OPTDecoderLayer)}")
+        if isinstance(module, OPTDecoderLayer):
+            auto_scale_block(module, name, w_bit, q_group_size, input_feat)
+
+    # Actually do the quantization
+    for n, m in model.named_modules():
+        if isinstance(m, nn.Linear):
+            m.weight.data = pseudo_quantize_tensor(m.weight.data, n_bit=w_bit, q_group_size=q_group_size)
+
+
 def evaluate(model, tokenizer):
     """
     Evaluate a model over the wikitext (version: wikitext-2-raw-v1) test set and calculate its perplexity
@@ -583,115 +885,133 @@ if __name__ == "__main__":
     # # Get model size  -----------------------------------------------------------------
     print(f"Model: {net._get_name()}")
 
+    # # Evaluate the model
+    # perplexity = evaluate(net, net_tokenizer)
+    # print("Full Model (No quantization)")
+    # print(f"Perplexity {perplexity:0.2f}")
+    # print(f"Size {get_model_size(net) / MiB:0.2f} MB")
+    #
+    # # Quantize the model ---------------------------------------------------------------
+    #
+    # # ----------------------------------------------------------------------------------
+    # # Naive Weight quantization based on weight magnitudes only
+    # # ----------------------------------------------------------------------------------
+    # print("\nQuantization based only on weight magnitudes ...")
+    # # test_tensor = torch.rand(128, 128)
+    # # pseudo_quantize_tensor(test_tensor, q_group_size=8)
+    #
+    # del net
+    # gc.collect()
+    # torch.cuda.empty_cache()
+    # net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+    #
+    # w_bits = 3
+    # quantized_group_size = 128
+    #
+    # pseudo_quantize_model_weight(net, n_bits=w_bits, q_group_size=quantized_group_size)
+    #
+    # perplexity = evaluate(net, net_tokenizer)
+    # net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
+    # print(f"Perplexity {perplexity:0.2f}")
+    # print(f"Size {net_size / MiB:0.2f} MB")
+    #
+    # # ---------------------------------------------------------------------------------
+    # # Activation Aware Quantization - preserving top 1% outliers
+    # # ---------------------------------------------------------------------------------
+    # print("\nActivation Aware Quantization - preserving full precision of top outliers")
+    #
+    # del net
+    # gc.collect()
+    # torch.cuda.empty_cache()
+    # net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+    #
+    # w_bits = 3
+    # quantized_group_size = 128
+    #
+    # input_features_stats = get_calib_features(net, net_tokenizer)
+    # pseudo_quantize_model_salient_weight_fp16(net, w_bits, quantized_group_size, input_features_stats)
+    #
+    # perplexity = evaluate(net, net_tokenizer)
+    # net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
+    # print(f"Perplexity {perplexity:0.2f}")
+    # print(f"Size {net_size / MiB:0.2f} MB")
+    #
+    # # ---------------------------------------------------------------------------------
+    # # Activation Aware Quantization - preserving 1% of random weights
+    # # ---------------------------------------------------------------------------------
+    # print("\nActivation Aware Quantization - preserving full precision of random outliers")
+    #
+    # del net
+    # gc.collect()
+    # torch.cuda.empty_cache()
+    # net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+    #
+    # w_bits = 3
+    # quantized_group_size = 128
+    #
+    # input_features_stats = get_calib_features(net, net_tokenizer)
+    # pseudo_quantize_model_random_weight_fp16(net, w_bits, quantized_group_size, input_features_stats)
+    #
+    # perplexity = evaluate(net, net_tokenizer)
+    # net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
+    # print(f"Perplexity {perplexity:0.2f}")
+    # print(f"Size {net_size / MiB:0.2f} MB")
+    #
+    # # ----------------------------------------------------------------------------------------
+    # # Activation Aware Quantization - Scale up important weights, quantize and then scale down
+    # # ----------------------------------------------------------------------------------------
+    # print("\nActivation Aware Quantization - Scale Up, Quantize & scale down weights")
+    #
+    # del net
+    # gc.collect()
+    # torch.cuda.empty_cache()
+    # net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+    #
+    # w_bits = 3
+    # quantized_group_size = 128
+    #
+    # input_features_stats = get_calib_features(net, net_tokenizer)
+    # pseudo_quantize_model_weight_scaleup(net, w_bits, quantized_group_size, input_features_stats, scale_factor=2)
+    #
+    # perplexity = evaluate(net, net_tokenizer)
+    # net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
+    # print(f"Perplexity {perplexity:0.2f}")
+    # print(f"Size {net_size / MiB:0.2f} MB")
+    #
+    # print("Effect of scaling factor in perplexity")
+    # scaling_factors_arr = [1, 2, 3, 4]
+    # perplexity_arr = []
+    # for scaling_factor in scaling_factors_arr:
+    #
+    #     del net
+    #     gc.collect()
+    #     torch.cuda.empty_cache()
+    #     net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+    #
+    #     pseudo_quantize_model_weight_scaleup(net, w_bits, quantized_group_size, input_features_stats, scaling_factor)
+    #     perplexity = evaluate(net, net_tokenizer)
+    #     perplexity_arr.append(perplexity)
+    #
+    # for sf_idx in range(len(perplexity_arr)):
+    #     print(f"\t scaling factor {scaling_factors_arr[sf_idx]}: perplexity={perplexity_arr[sf_idx]:2f}")
+
+    # -------------------------------------------------------------------------------------
+    # Finding the optimal scaling factor
+    # -------------------------------------------------------------------------------------
+    print("\nActivation Aware Quantization - Automatically finding the scale factor for activation aware training")
+
+    del net
+    gc.collect()
+    torch.cuda.empty_cache()
+    net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
+
+    input_features_stats = get_calib_features(net, net_tokenizer)
+    pseudo_quantize_model_weight_auto_scale(net, w_bit=3, q_group_size=128, input_feat=input_features_stats)
+
     # Evaluate the model
-    perplexity = evaluate(net, net_tokenizer)
-    print("Full Model (No quantization)")
-    print(f"Perplexity {perplexity:0.2f}")
-    print(f"Size {get_model_size(net) / MiB:0.2f} MB")
-
-    # Quantize the model ---------------------------------------------------------------
-
-    # ----------------------------------------------------------------------------------
-    # Naive Weight quantization based on weight magnitudes only
-    # ----------------------------------------------------------------------------------
-    print("\nQuantization based only on weight magnitudes ...")
-    # test_tensor = torch.rand(128, 128)
-    # pseudo_quantize_tensor(test_tensor, q_group_size=8)
-
-    del net
-    gc.collect()
-    torch.cuda.empty_cache()
-    net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
-
-    w_bits = 3
-    quantized_group_size = 128
-
-    pseudo_quantize_model_weight(net, n_bits=w_bits, q_group_size=quantized_group_size)
-
-    perplexity = evaluate(net, net_tokenizer)
-    net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
-    print(f"Perplexity {perplexity:0.2f}")
-    print(f"Size {net_size / MiB:0.2f} MB")
-
-    # ---------------------------------------------------------------------------------
-    # Activation Aware Quantization - preserving top 1% outliers
-    # ---------------------------------------------------------------------------------
-    print("\nActivation Aware Quantization - preserving full precision of top outliers")
-
-    del net
-    gc.collect()
-    torch.cuda.empty_cache()
-    net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
-
-    w_bits = 3
-    quantized_group_size = 128
-
-    input_features_stats = get_calib_features(net, net_tokenizer)
-    pseudo_quantize_model_salient_weight_fp16(net, w_bits, quantized_group_size, input_features_stats)
-
-    perplexity = evaluate(net, net_tokenizer)
-    net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
-    print(f"Perplexity {perplexity:0.2f}")
-    print(f"Size {net_size / MiB:0.2f} MB")
-
-    # ---------------------------------------------------------------------------------
-    # Activation Aware Quantization - preserving 1% of random weights
-    # ---------------------------------------------------------------------------------
-    print("\nActivation Aware Quantization - preserving full precision of random outliers")
-
-    del net
-    gc.collect()
-    torch.cuda.empty_cache()
-    net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
-
-    w_bits = 3
-    quantized_group_size = 128
-
-    input_features_stats = get_calib_features(net, net_tokenizer)
-    pseudo_quantize_model_random_weight_fp16(net, w_bits, quantized_group_size, input_features_stats)
-
-    perplexity = evaluate(net, net_tokenizer)
-    net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
-    print(f"Perplexity {perplexity:0.2f}")
-    print(f"Size {net_size / MiB:0.2f} MB")
-
-    # ----------------------------------------------------------------------------------------
-    # Activation Aware Quantization - Scale up important weights, quantize and then scale down
-    # ----------------------------------------------------------------------------------------
-    print("\nActivation Aware Quantization - Scale Up, Quantize & scale down weights")
-
-    del net
-    gc.collect()
-    torch.cuda.empty_cache()
-    net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
-
-    w_bits = 3
-    quantized_group_size = 128
-
-    input_features_stats = get_calib_features(net, net_tokenizer)
-    pseudo_quantize_model_weight_scaleup(net, w_bits, quantized_group_size, input_features_stats, scale_factor=2)
-
-    perplexity = evaluate(net, net_tokenizer)
-    net_size = get_model_size(net, data_width_bits=w_bits, q_group_size=quantized_group_size)
-    print(f"Perplexity {perplexity:0.2f}")
-    print(f"Size {net_size / MiB:0.2f} MB")
-
-    print("Effect of scaling factor in perplexity")
-    scaling_factors_arr = [1, 2, 3, 4]
-    perplexity_arr = []
-    for scaling_factor in scaling_factors_arr:
-
-        del net
-        gc.collect()
-        torch.cuda.empty_cache()
-        net = transformers.AutoModelForCausalLM.from_pretrained(net_path, device_map="auto")
-        
-        pseudo_quantize_model_weight_scaleup(net, w_bits, quantized_group_size, input_features_stats, scaling_factor)
-        perplexity = evaluate(net, net_tokenizer)
-        perplexity_arr.append(perplexity)
-
-    for sf_idx in range(len(perplexity_arr)):
-        print(f"\t scaling factor {scaling_factors_arr[sf_idx]}: perplexity={perplexity_arr[sf_idx]:2f}")
-
+    model_perplexity = evaluate(net, net_tokenizer)
+    model_size = get_model_size(net, data_width_bits=3, q_group_size=128)
+    print(f"\nmodel perplexity: {model_perplexity:.2f}")
+    print(f"model size: {model_size / MiB:.2f} MiB")
     import pdb
     pdb.set_trace()
